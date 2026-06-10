@@ -1,5 +1,8 @@
 import Pago from "../models/Pago.js";
 import Abono from "../models/Abono.js";
+import Inscripcion from "../models/Inscripcion.js";
+import Grupo from "../models/Grupo.js";
+import { grupoIdDeInscripcion } from "./grupoInscripcion.js";
 
 export function parseFechaLocal(valor) {
   if (!valor) return null;
@@ -100,6 +103,238 @@ export function normalizarDatosPago(datosPago = {}) {
 
 export function crearPagoId(idAlumno, grupoId) {
   return `${String(idAlumno).trim()}-${String(grupoId).trim()}`.toUpperCase();
+}
+
+function escaparRegex(texto) {
+  return String(texto || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+export function filtroPagoPorAlumnoGrupo(idAlumno, grupoId) {
+  const id = String(idAlumno || "").trim();
+  const gid = String(grupoId || "").trim();
+  if (!id || !gid) return { _id: null };
+
+  const idRegex = new RegExp(`^${escaparRegex(id)}$`, "i");
+  const gidRegex = new RegExp(`^${escaparRegex(gid)}$`, "i");
+  const pagoId = crearPagoId(id, gid);
+
+  return {
+    $or: [
+      { pagoId },
+      {
+        pagoId: {
+          $regex: new RegExp(
+            `^${escaparRegex(id)}-${escaparRegex(gid)}$`,
+            "i"
+          ),
+        },
+      },
+      { idAlumno: idRegex, grupoId: gidRegex },
+      { idAlumno: id, grupoId: gid },
+    ],
+  };
+}
+
+/** Marca inactivo el pago ligado a una inscripción dada de baja */
+export async function desactivarPagoDeInscripcion(
+  idAlumno,
+  grupoId,
+  fechaBaja = new Date()
+) {
+  await Pago.updateMany(filtroPagoPorAlumnoGrupo(idAlumno, grupoId), {
+    $set: { activo: false, fechaBaja },
+  });
+  return Pago.findOne(filtroPagoPorAlumnoGrupo(idAlumno, grupoId)).lean();
+}
+
+/** Reactiva el pago cuando la inscripción vuelve a Activa */
+export async function reactivarPagoDeInscripcion(idAlumno, grupoId) {
+  await Pago.updateMany(filtroPagoPorAlumnoGrupo(idAlumno, grupoId), {
+    $set: { activo: true, fechaBaja: null },
+  });
+  return Pago.findOne(filtroPagoPorAlumnoGrupo(idAlumno, grupoId)).lean();
+}
+
+/** Actualiza mensualidad en inscripción y pago (subida, descuento o cambio de curso) */
+export async function actualizarMontoMensualidadAlumnoGrupo(
+  idAlumno,
+  grupoId,
+  montoMensualidad
+) {
+  const monto = Number(montoMensualidad);
+  if (!Number.isFinite(monto) || monto <= 0) {
+    throw new Error("Captura un monto de mensualidad válido (mayor a 0)");
+  }
+
+  const id = String(idAlumno || "").trim();
+  const gid = String(grupoId || "").trim();
+  if (!id || !gid) {
+    throw new Error("Faltan idAlumno o grupoId");
+  }
+
+  const inscripcion = await Inscripcion.findOneAndUpdate(
+    {
+      idAlumno: { $regex: new RegExp(`^${escaparRegex(id)}$`, "i") },
+      grupoId: { $regex: new RegExp(`^${escaparRegex(gid)}$`, "i") },
+    },
+    { $set: { montoMensualidad: monto } },
+    { new: true }
+  ).lean();
+
+  const pago = await Pago.findOneAndUpdate(
+    filtroPagoPorAlumnoGrupo(id, gid),
+    { $set: { montoPago: monto } },
+    { new: true }
+  ).lean();
+
+  return { inscripcion, pago, montoMensualidad: monto };
+}
+
+function filtroPagosPorGrupoId(grupoId) {
+  const gid = String(grupoId || "").trim();
+  if (!gid) return { _id: null };
+  const escaped = escaparRegex(gid);
+  const gidRegex = new RegExp(`^${escaped}$`, "i");
+  return {
+    $or: [
+      { grupoId: gidRegex },
+      { pagoId: { $regex: new RegExp(`-${escaped}$`, "i") } },
+    ],
+  };
+}
+
+/** Refleja en pagos el nombre de curso actual del grupo (p. ej. al reasignar curso) */
+export async function sincronizarNombreCursoEnPagos() {
+  const [grupos, pagos] = await Promise.all([
+    Grupo.find().select("IdGrupo idGrupo GrupoId nombreCurso").lean(),
+    Pago.find().select("pagoId grupoId nombreCurso").lean(),
+  ]);
+
+  const gruposMap = new Map();
+  for (const g of grupos) {
+    const id = String(g.IdGrupo || g.idGrupo || g.GrupoId || "")
+      .trim()
+      .toUpperCase();
+    if (id) gruposMap.set(id, g);
+  }
+
+  let actualizados = 0;
+  for (const pago of pagos) {
+    const gid = String(pago.grupoId || "").trim().toUpperCase();
+    const grupo = gruposMap.get(gid);
+    if (!grupo) continue;
+
+    const nombreGrupo = String(grupo.nombreCurso || "").trim();
+    if (!nombreGrupo || nombreGrupo === String(pago.nombreCurso || "").trim()) {
+      continue;
+    }
+
+    await Pago.updateOne(
+      { pagoId: pago.pagoId },
+      { $set: { nombreCurso: nombreGrupo } }
+    );
+    actualizados += 1;
+  }
+
+  return { actualizados };
+}
+
+export async function propagarNombreCursoDeGrupo(grupoId, nombreCurso) {
+  const nombre = String(nombreCurso || "").trim();
+  if (!nombre) return { pagosActualizados: 0 };
+
+  const res = await Pago.updateMany(filtroPagosPorGrupoId(grupoId), {
+    $set: { nombreCurso: nombre },
+  });
+
+  return { pagosActualizados: res.modifiedCount || 0 };
+}
+
+/** Repara pagos que quedaron activos mientras su inscripción ya está en Baja */
+export async function sincronizarPagosInactivosConInscripciones() {
+  const inscripcionesBaja = await Inscripcion.find({
+    estatus: { $regex: /^baja$/i },
+  }).lean();
+
+  for (const ins of inscripcionesBaja) {
+    const idAlumno = String(ins.idAlumno || "").trim();
+    const grupoId = grupoIdDeInscripcion(ins);
+    if (!idAlumno || !grupoId) continue;
+
+    await desactivarPagoDeInscripcion(
+      idAlumno,
+      grupoId,
+      ins.fechaBaja || new Date()
+    );
+  }
+}
+
+/** Elimina pagos y abonos huérfanos de un grupo (sin inscripciones) */
+export async function limpiarDatosPagosDeGrupo(grupoId) {
+  const gid = String(grupoId || "").trim();
+  if (!gid) return { pagosEliminados: 0, abonosEliminados: 0 };
+
+  const pagos = await Pago.find({
+    $or: [{ grupoId: gid }, { pagoId: { $regex: new RegExp(`-${gid}$`, "i") } }],
+  }).lean();
+
+  const pagoIds = pagos.map((p) => p.pagoId).filter(Boolean);
+  let abonosEliminados = 0;
+
+  if (pagoIds.length) {
+    const abRes = await Abono.deleteMany({ pagoId: { $in: pagoIds } });
+    abonosEliminados = abRes.deletedCount || 0;
+  }
+
+  const pagRes = await Pago.deleteMany({
+    $or: [{ grupoId: gid }, { pagoId: { $regex: new RegExp(`-${gid}$`, "i") } }],
+  });
+
+  return {
+    pagosEliminados: pagRes.deletedCount || 0,
+    abonosEliminados,
+  };
+}
+
+/** Elimina pagos huérfanos cuando el grupo ya no existe ni hay inscripción */
+export async function sincronizarPagosHuérfanosDeGruposEliminados() {
+  const [inscripciones, grupos, pagos] = await Promise.all([
+    Inscripcion.find().select("grupoId GrupoId idGrupo").lean(),
+    Grupo.find().select("IdGrupo idGrupo GrupoId").lean(),
+    Pago.find().select("grupoId pagoId").lean(),
+  ]);
+
+  const idsVigentes = new Set();
+
+  for (const g of grupos) {
+    const id = String(g.IdGrupo || g.idGrupo || g.GrupoId || "")
+      .trim()
+      .toUpperCase();
+    if (id) idsVigentes.add(id);
+  }
+
+  for (const ins of inscripciones) {
+    const id = String(ins.grupoId || ins.GrupoId || ins.idGrupo || "")
+      .trim()
+      .toUpperCase();
+    if (id) idsVigentes.add(id);
+  }
+
+  let pagosEliminados = 0;
+  let abonosEliminados = 0;
+  const gruposLimpiados = new Set();
+
+  for (const pago of pagos) {
+    const gid = String(pago.grupoId || "").trim().toUpperCase();
+    if (!gid || idsVigentes.has(gid) || gruposLimpiados.has(gid)) continue;
+
+    gruposLimpiados.add(gid);
+    const res = await limpiarDatosPagosDeGrupo(gid);
+    pagosEliminados += res.pagosEliminados;
+    abonosEliminados += res.abonosEliminados;
+  }
+
+  return { pagosEliminados, abonosEliminados };
 }
 
 function obtenerUltimoDiaDelMes(anio, mes) {

@@ -1,4 +1,8 @@
 import * as React from "react";
+import { useState } from "react";
+import { MessageCircle } from "lucide-react";
+import { construirMensajeRecordatorioPago } from "../../utils/mensajesWhatsApp";
+import { MensajeWhatsAppModal } from "./MensajeWhatsAppModal";
 
 const formatearFecha = (fechaIso: string) => {
     if (!fechaIso) return "Sin fecha";
@@ -22,10 +26,12 @@ interface PaymentRowProps {
     vista?: 'control' | 'registro' | 'proximos';
     onRegisterPayment: (mesElegido?: any) => void;
     onChangePaymentDate: () => void;
+    onEditMensualidades?: () => void;
     onPrintReceipt?: (mes: any) => void;
 }
 
-export function PaymentRow({ payment, vista, onRegisterPayment, onChangePaymentDate, onPrintReceipt }: PaymentRowProps) {
+export function PaymentRow({ payment, vista, onRegisterPayment, onChangePaymentDate, onEditMensualidades, onPrintReceipt }: PaymentRowProps) {
+    const [modalRecordatorio, setModalRecordatorio] = useState(false);
     const isPaid = payment.status === "Pagado" || vista === 'registro';
     const esProgramado = payment.status === "Programado" || payment.cobroProgramado;
     const periodosRaw = payment.periodosMensuales || [];
@@ -77,7 +83,61 @@ export function PaymentRow({ payment, vista, onRegisterPayment, onChangePaymentD
 
     const vencido = !esProgramado && estaVencido(payment.fechaLimite, payment.status);
 
+    const puedeRecordatorio =
+        !isPaid &&
+        payment.status !== "Baja" &&
+        payment.status !== "Programado";
+
+    const periodoRecordatorio =
+        periodosRaw.find((m: any) => {
+            if (!payment.fechaLimite || !m.vencimiento) return false;
+            const v = new Date(m.vencimiento);
+            const lim = new Date(payment.fechaLimite);
+            return (
+                v.getFullYear() === lim.getFullYear() &&
+                v.getMonth() === lim.getMonth()
+            );
+        }) ||
+        periodosRaw.find(
+            (m: any) => m.status === "Pendiente" || m.status === "Parcial"
+        );
+
+    const montoMes = Number(
+        periodoRecordatorio?.monto ?? payment.montoTotal ?? 0
+    );
+    const abonadoMes = Number(
+        periodoRecordatorio?.pagado ?? payment.montoPagado ?? 0
+    );
+    const saldoMes =
+        periodoRecordatorio?.saldo != null
+            ? Number(periodoRecordatorio.saldo)
+            : Math.max(0, montoMes - abonadoMes);
+
+    const mensajeRecordatorio = construirMensajeRecordatorioPago({
+        nombreTutor: payment.nombreTutor,
+        nombreCurso: payment.nombreCurso,
+        montoMensualidad: montoMes,
+        montoAbonado: abonadoMes,
+        saldoPendiente: saldoMes,
+        diaPago: payment.diaPagoFijo,
+        fechaLimite: payment.fechaLimite,
+        mesCobro: payment.mesCobroVigente,
+    });
+
     return (
+        <>
+        <MensajeWhatsAppModal
+            open={modalRecordatorio}
+            onClose={() => setModalRecordatorio(false)}
+            titulo="Recordatorio de pago"
+            mensajeInicial={mensajeRecordatorio}
+            telefono={payment.telefonoTutor}
+            destinatarioLabel={
+                payment.nombreTutor || payment.telefonoTutor
+                    ? `Para: ${payment.nombreTutor || "Tutor"}${payment.telefonoTutor ? ` · ${payment.telefonoTutor}` : ""}`
+                    : undefined
+            }
+        />
         <div className="rounded-xl border bg-white p-6 shadow-sm space-y-4">
 
             <div className="flex items-center justify-between gap-4 flex-wrap">
@@ -119,6 +179,12 @@ export function PaymentRow({ payment, vista, onRegisterPayment, onChangePaymentD
                                 <span className="px-1.5 py-0.5 rounded text-[9px] font-black uppercase tracking-wider bg-emerald-100 text-emerald-700 border border-emerald-200">ACTIVO</span>
                             )}
                         </div>
+                        {payment.nombreTutor || payment.telefonoTutor ? (
+                            <span className="text-[10px] text-gray-500 mt-0.5">
+                                {payment.nombreTutor ? `Tutor: ${payment.nombreTutor}` : "Tutor"}
+                                {payment.telefonoTutor ? ` · ${payment.telefonoTutor}` : ""}
+                            </span>
+                        ) : null}
                     </div>
 
                     <div className="flex flex-col min-w-[130px]">
@@ -147,11 +213,34 @@ export function PaymentRow({ payment, vista, onRegisterPayment, onChangePaymentD
                     )}
                 </div>
 
+                <div className="flex items-center gap-2 flex-wrap">
+                {onEditMensualidades && (payment.cursosDetalle?.length || payment.nombreCurso) ? (
+                    <button
+                        type="button"
+                        onClick={onEditMensualidades}
+                        className="inline-flex items-center gap-1.5 rounded-lg border border-cyan-200 bg-cyan-50 px-3 py-1.5 text-[10px] font-black uppercase tracking-wide text-cyan-800 hover:bg-cyan-100 transition-colors"
+                        title="Editar mensualidad por curso"
+                    >
+                        Editar mensualidad
+                    </button>
+                ) : null}
+                {puedeRecordatorio && (
+                    <button
+                        type="button"
+                        onClick={() => setModalRecordatorio(true)}
+                        className="inline-flex items-center gap-1.5 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-1.5 text-[10px] font-black uppercase tracking-wide text-emerald-800 hover:bg-emerald-100 transition-colors"
+                        title="Abrir WhatsApp con recordatorio de pago al tutor"
+                    >
+                        <MessageCircle className="h-3.5 w-3.5" />
+                        Recordatorio
+                    </button>
+                )}
                 <div className={`px-3 py-1 rounded-full text-[10px] font-bold uppercase border ${isPaid ? "bg-emerald-100 text-emerald-700 border-emerald-200" :
                     esProgramado ? "bg-sky-50 text-sky-700 border-sky-200" :
                         "bg-amber-50 text-amber-600 border-amber-100"
                     }`}>
                     {payment.status}
+                </div>
                 </div>
             </div>
 
@@ -219,5 +308,6 @@ export function PaymentRow({ payment, vista, onRegisterPayment, onChangePaymentD
                 </div>
             )}
         </div>
+        </>
     );
 }

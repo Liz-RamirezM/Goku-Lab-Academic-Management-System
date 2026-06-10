@@ -86,11 +86,16 @@ export async function getProfesores() {
     return res.json();
 }
 
-export async function crearProfesor(nombre: string) {
+export async function crearProfesor(datos: {
+    nombre: string;
+    usuario: string;
+    password: string;
+    telefono?: string;
+}) {
     const res = await apiFetch("/profesores", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ nombre }),
+        body: JSON.stringify(datos),
     });
 
     const data = await res.json();
@@ -100,11 +105,14 @@ export async function crearProfesor(nombre: string) {
     return data;
 }
 
-export async function renombrarProfesor(idProfesor: string, nombre: string) {
+export async function renombrarProfesor(
+    idProfesor: string,
+    datos: { nombre?: string; telefono?: string }
+) {
     const res = await apiFetch(`/profesores/${idProfesor}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ nombre }),
+        body: JSON.stringify(datos),
     });
 
     const data = await res.json();
@@ -128,6 +136,24 @@ export async function actualizarEstatusProfesor(
     if (!res.ok) throw new Error(data.error || "Error al actualizar el maestro");
 
     notifyDataChanged({ tipo: "profesor" });
+    return data;
+}
+
+export async function restablecerPasswordProfesor(
+    idProfesor: string,
+    password: string
+) {
+    const res = await apiFetch(`/profesores/${idProfesor}/password`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ password }),
+    });
+
+    const data = await res.json();
+    if (!res.ok) {
+        throw new Error(data.error || "Error al restablecer la contraseña");
+    }
+
     return data;
 }
 
@@ -211,6 +237,9 @@ export async function actualizarEstatusCurso(
     if (!res.ok) throw new Error(data.error || "Error al actualizar el curso");
 
     notifyDataChanged({ tipo: "curso" });
+    notifyDataChanged({ tipo: "pago" });
+    notifyDataChanged({ tipo: "inscripcion" });
+    notifyDataChanged({ tipo: "baja" });
     return data;
 }
 
@@ -219,11 +248,23 @@ export async function eliminarCurso(idCurso: string) {
         method: "DELETE",
     });
 
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || "Error al borrar el curso");
+    const responseData = await res.json();
+
+    if (!res.ok) {
+        const lista =
+          Array.isArray(responseData.alumnos) && responseData.alumnos.length > 0
+            ? `\n${responseData.alumnos
+                .map(
+                  (a: { nombreAlumno?: string; idAlumno?: string; estatus?: string }) =>
+                    `• ${a.nombreAlumno || a.idAlumno}${a.estatus ? ` (${a.estatus})` : ""}`
+                )
+                .join("\n")}`
+            : "";
+        throw new Error((responseData.error || "Error al eliminar curso") + lista);
+    }
 
     notifyDataChanged({ tipo: "curso" });
-    return data;
+    return responseData;
 }
 
 export async function reasignarCursoGrupo(grupoId: string, idCurso: string) {
@@ -237,13 +278,39 @@ export async function reasignarCursoGrupo(grupoId: string, idCurso: string) {
     if (!res.ok) throw new Error(data.error || "Error al reasignar el curso");
 
     notifyDataChanged({ tipo: "grupo" });
+    notifyDataChanged({ tipo: "inscripcion" });
+    notifyDataChanged({ tipo: "baja" });
+    notifyDataChanged({ tipo: "pago" });
     return data;
 }
 
-export async function getAlumnos(busqueda: string = "") {
-    const path = busqueda
-        ? `/alumnos?q=${encodeURIComponent(busqueda)}`
-        : "/alumnos";
+export async function actualizarHorarioGrupo(
+    grupoId: string,
+    datos: { diaClase: string; horaClase: string; duracionClase?: string }
+) {
+    const res = await apiFetch(`/grupos/${grupoId}/horario`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(datos),
+    });
+
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "Error al actualizar el horario");
+
+    notifyDataChanged({ tipo: "grupo" });
+    return data;
+}
+
+export async function getAlumnos(
+  busqueda: string = "",
+  opciones?: { soloInscribibles?: boolean }
+) {
+    const params = new URLSearchParams();
+    if (busqueda) params.set("q", busqueda);
+    if (opciones?.soloInscribibles) params.set("paraInscripcion", "1");
+
+    const query = params.toString();
+    const path = query ? `/alumnos?${query}` : "/alumnos";
 
     const res = await apiFetch(path);
 
@@ -252,6 +319,7 @@ export async function getAlumnos(busqueda: string = "") {
 }
 
 export async function actualizarAlumno(idAlumno: string, data: {
+  nombreAlumno?: string;
   telefono?: string;
   tutor?: string;
   observaciones?: string;
@@ -384,7 +452,12 @@ export async function crearInscripcion(data: {
 export async function actualizarInscripcionAlumno(
   idAlumno: string,
   grupoId: string,
-  data: { modalidad?: string; comentarios?: string }
+  data: {
+    modalidad?: string;
+    comentarios?: string;
+    comentarioAlumno?: string;
+    montoMensualidad?: number;
+  }
 ) {
   const res = await apiFetch(`/inscripciones/${idAlumno}/${grupoId}`, {
     method: "PATCH",
@@ -399,7 +472,40 @@ export async function actualizarInscripcionAlumno(
   }
 
   notifyDataChanged({ tipo: "inscripcion" });
+  notifyDataChanged({ tipo: "pago" });
   return responseData;
+}
+
+export async function actualizarMontoMensualidad(
+  pagoId: string,
+  montoMensualidad: number
+) {
+  const res = await apiFetch(`/pagos/actualizar-monto/${encodeURIComponent(pagoId)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ montoMensualidad }),
+  });
+
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(data.error || "Error al actualizar la mensualidad");
+  }
+
+  notifyDataChanged({ tipo: "pago" });
+  notifyDataChanged({ tipo: "inscripcion" });
+  return data;
+}
+
+export async function actualizarMontoInscripcion(
+  idAlumno: string,
+  grupoId: string,
+  montoMensualidad: number
+) {
+  const res = await actualizarInscripcionAlumno(idAlumno, grupoId, {
+    montoMensualidad,
+  });
+  notifyDataChanged({ tipo: "pago" });
+  return res;
 }
 
 export async function getInscripcionesPorGrupo(grupoId: string) {
@@ -490,6 +596,35 @@ export async function actualizarComentarioGrupo(
 
     notifyDataChanged({ tipo: "grupo" });
     return responseData;
+}
+
+export async function getNotaClaseSesion(grupoId: string, fecha: string) {
+    const res = await apiFetch(
+        `/notas-clase-sesion/${encodeURIComponent(grupoId)}?fecha=${encodeURIComponent(fecha)}`
+    );
+    const data = await res.json();
+    if (!res.ok) {
+        throw new Error(data.error || "Error al obtener la nota de la clase");
+    }
+    return data;
+}
+
+export async function actualizarNotaClaseSesion(
+    grupoId: string,
+    fecha: string,
+    notaHtml: string
+) {
+    const res = await apiFetch(`/grupos/${encodeURIComponent(grupoId)}/nota-sesion`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ fecha, notaHtml }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+        throw new Error(data.error || "Error al guardar la nota de la clase");
+    }
+    notifyDataChanged({ tipo: "grupo" });
+    return data;
 }
 
 export async function getPagosConEstatus() {
@@ -667,3 +802,21 @@ export const actualizarDiaPago = async (pagoId: string, nuevoDia: number) => {
   notifyDataChanged({ tipo: "pago" });
   return responseData;
 };
+
+export async function getNotificacionesProfesor() {
+  const res = await apiFetch("/notificaciones-profesor/mis");
+  if (!res.ok) throw new Error("Error al obtener notificaciones");
+  return res.json();
+}
+
+export async function marcarNotificacionProfesorLeida(notificacionId: string) {
+  const res = await apiFetch(
+    `/notificaciones-profesor/${encodeURIComponent(notificacionId)}/leida`,
+    { method: "PATCH" }
+  );
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(data.error || "Error al marcar notificación");
+  }
+  return data;
+}

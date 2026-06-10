@@ -1,5 +1,7 @@
 import express from "express";
+import bcrypt from "bcryptjs";
 import Profesor from "../models/Profesor.js";
+import Usuario from "../models/Usuario.js";
 import Grupo from "../models/Grupo.js";
 import Counter from "../models/Counter.js";
 import { generarId } from "../utils/generarId.js";
@@ -30,8 +32,23 @@ async function generarIdProfesorSeguro() {
 
 router.get("/", async (req, res) => {
   try {
-    const profesores = await Profesor.find().lean();
-    res.status(200).json(profesores);
+    const [profesores, cuentas] = await Promise.all([
+      Profesor.find().lean(),
+      Usuario.find({ rol: "profesor" }).select("usuario idProfesor").lean(),
+    ]);
+
+    const cuentaPorProfesor = new Map(
+      cuentas
+        .filter((u) => u.idProfesor)
+        .map((u) => [String(u.idProfesor).trim(), String(u.usuario || "").trim()])
+    );
+
+    res.status(200).json(
+      profesores.map((p) => ({
+        ...p,
+        usuarioAcceso: cuentaPorProfesor.get(String(p.idProfesor || "").trim()) || "",
+      }))
+    );
   } catch (error) {
     console.error("ERROR GET PROFESORES:", error);
     res.status(500).json({
@@ -45,9 +62,30 @@ router.get("/", async (req, res) => {
 router.post("/", async (req, res) => {
   try {
     const nombre = String(req.body?.nombre || "").trim();
+    const usuarioLogin = String(req.body?.usuario || "").toLowerCase().trim();
+    const password = String(req.body?.password || "");
+    const telefono = String(req.body?.telefono || "").trim();
 
     if (!nombre) {
       return res.status(400).json({ error: "El nombre del maestro es obligatorio" });
+    }
+
+    if (!usuarioLogin || usuarioLogin.length < 3) {
+      return res.status(400).json({
+        error: "El usuario de acceso es obligatorio (mínimo 3 caracteres)",
+      });
+    }
+
+    if (!/^[a-z0-9._-]+$/.test(usuarioLogin)) {
+      return res.status(400).json({
+        error: "El usuario solo puede contener letras, números, puntos, guiones y guiones bajos",
+      });
+    }
+
+    if (!password || password.length < 6) {
+      return res.status(400).json({
+        error: "La contraseña es obligatoria (mínimo 6 caracteres)",
+      });
     }
 
     const yaExiste = await Profesor.findOne({
@@ -57,15 +95,33 @@ router.post("/", async (req, res) => {
       return res.status(409).json({ error: "Ya existe un maestro con ese nombre" });
     }
 
+    const usuarioDuplicado = await Usuario.findOne({ usuario: usuarioLogin }).lean();
+    if (usuarioDuplicado) {
+      return res.status(409).json({ error: "Ese usuario de acceso ya está en uso" });
+    }
+
     const idProfesor = await generarIdProfesorSeguro();
 
     const profesor = await Profesor.create({
       idProfesor,
       nombre,
+      telefono,
       estatus: "Activo",
     });
 
-    res.status(201).json(profesor);
+    const passwordHash = await bcrypt.hash(password, 10);
+    await Usuario.create({
+      usuario: usuarioLogin,
+      password: passwordHash,
+      nombreCompleto: nombre,
+      rol: "profesor",
+      idProfesor,
+    });
+
+    res.status(201).json({
+      ...profesor.toObject(),
+      usuarioAcceso: usuarioLogin,
+    });
   } catch (error) {
     console.error("ERROR POST PROFESOR:", error);
     res.status(500).json({
@@ -75,13 +131,61 @@ router.post("/", async (req, res) => {
   }
 });
 
-// Editar el nombre de un maestro (se refleja en sus grupos)
+// Restablecer contraseña de acceso (solo administrador vía ruta protegida)
+router.patch("/:idProfesor/password", async (req, res) => {
+  try {
+    const { idProfesor } = req.params;
+    const password = String(req.body?.password || "");
+
+    if (!password || password.length < 6) {
+      return res.status(400).json({
+        error: "La contraseña debe tener al menos 6 caracteres",
+      });
+    }
+
+    const profesor = await Profesor.findOne({ idProfesor });
+    if (!profesor) {
+      return res.status(404).json({ error: "Maestro no encontrado" });
+    }
+
+    const usuario = await Usuario.findOne({ idProfesor, rol: "profesor" });
+    if (!usuario) {
+      return res.status(404).json({
+        error: "Este maestro no tiene cuenta de acceso configurada",
+      });
+    }
+
+    usuario.password = await bcrypt.hash(password, 10);
+    await usuario.save();
+
+    res.status(200).json({
+      ok: true,
+      idProfesor,
+      usuarioAcceso: usuario.usuario,
+    });
+  } catch (error) {
+    console.error("ERROR PATCH PROFESOR PASSWORD:", error);
+    res.status(500).json({
+      error: "Error al restablecer la contraseña",
+      detalle: error.message,
+    });
+  }
+});
+
+// Editar nombre y/o teléfono de un maestro (el nombre se refleja en sus grupos)
 router.patch("/:idProfesor", async (req, res) => {
   try {
     const { idProfesor } = req.params;
-    const nombre = String(req.body?.nombre || "").trim();
+    const tieneNombre = req.body?.nombre !== undefined;
+    const tieneTelefono = req.body?.telefono !== undefined;
+    const nombre = tieneNombre ? String(req.body.nombre).trim() : undefined;
+    const telefono = tieneTelefono ? String(req.body.telefono).trim() : undefined;
 
-    if (!nombre) {
+    if (!tieneNombre && !tieneTelefono) {
+      return res.status(400).json({ error: "Indica nombre o teléfono a actualizar" });
+    }
+
+    if (tieneNombre && !nombre) {
       return res.status(400).json({ error: "El nombre del maestro es obligatorio" });
     }
 
@@ -90,29 +194,42 @@ router.patch("/:idProfesor", async (req, res) => {
       return res.status(404).json({ error: "Maestro no encontrado" });
     }
 
-    const duplicado = await Profesor.findOne({
-      idProfesor: { $ne: idProfesor },
-      nombre: new RegExp(`^${nombre.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i"),
-    });
-    if (duplicado) {
-      return res.status(409).json({ error: "Ya existe un maestro con ese nombre" });
+    let nombreAnterior = profesor.nombre;
+
+    if (tieneNombre && nombre !== profesor.nombre) {
+      const duplicado = await Profesor.findOne({
+        idProfesor: { $ne: idProfesor },
+        nombre: new RegExp(`^${nombre.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i"),
+      });
+      if (duplicado) {
+        return res.status(409).json({ error: "Ya existe un maestro con ese nombre" });
+      }
+      profesor.nombre = nombre;
     }
 
-    const nombreAnterior = profesor.nombre;
-    profesor.nombre = nombre;
+    if (tieneTelefono) {
+      profesor.telefono = telefono;
+    }
+
     await profesor.save();
 
-    // Reflejar el nuevo nombre en los grupos asignados
-    await Grupo.updateMany(
-      { $or: [{ idProfesor }, { nombreProfesor: nombreAnterior }] },
-      { $set: { idProfesor, nombreProfesor: nombre } }
-    );
+    if (tieneNombre && nombre !== nombreAnterior) {
+      await Usuario.updateMany(
+        { idProfesor, rol: "profesor" },
+        { $set: { nombreCompleto: profesor.nombre } }
+      );
+
+      await Grupo.updateMany(
+        { $or: [{ idProfesor }, { nombreProfesor: nombreAnterior }] },
+        { $set: { idProfesor, nombreProfesor: profesor.nombre } }
+      );
+    }
 
     res.status(200).json(profesor);
   } catch (error) {
-    console.error("ERROR PATCH NOMBRE PROFESOR:", error);
+    console.error("ERROR PATCH PROFESOR:", error);
     res.status(500).json({
-      error: "Error al editar el nombre del maestro",
+      error: "Error al editar el maestro",
       detalle: error.message,
     });
   }
@@ -176,6 +293,7 @@ router.delete("/:idProfesor", async (req, res) => {
     }
 
     await Profesor.deleteOne({ idProfesor });
+    await Usuario.deleteMany({ idProfesor, rol: "profesor" });
 
     res.status(200).json({
       ok: true,

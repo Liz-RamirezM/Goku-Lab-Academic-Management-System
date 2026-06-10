@@ -8,10 +8,16 @@ import {
 import { toast } from "sonner";
 import {
   mesCobroAFechaInicio,
-  toDateInputValue,
   toMonthInputValue,
   validarFechasInscripcion,
 } from "../../utils/fechasInscripcion";
+import { useColaWhatsApp } from "../../hooks/useColaWhatsApp";
+import { WhatsAppColaHost } from "./WhatsAppColaHost";
+import {
+  avisoGrupoAsignacionEInscripcion,
+  normalizarProfesorContacto,
+  type ItemWhatsAppCola,
+} from "../../utils/avisosWhatsAppProfesor";
 
 interface NuevoGrupoFormProps {
   onClose: () => void;
@@ -43,6 +49,7 @@ export default function NuevoGrupoForm({
   const [cargandoCatalogos, setCargandoCatalogos] = useState(true);
   const [buscandoAlumnos, setBuscandoAlumnos] = useState(false);
   const [guardando, setGuardando] = useState(false);
+  const colaWhatsApp = useColaWhatsApp();
 
   const [modoAlumno, setModoAlumno] = useState<"existente" | "nuevo">(
     "existente"
@@ -108,6 +115,7 @@ export default function NuevoGrupoForm({
           .map((prof: any) => ({
             idProfesor: prof.idProfesor || prof.IdProfesor || "",
             nombre: prof.nombre || prof.nombreProfesor || "",
+            telefono: prof.telefono || "",
             estatus: prof.estatus || prof.Estatus || "Activo",
           }))
           .filter(
@@ -137,7 +145,7 @@ export default function NuevoGrupoForm({
 
       try {
         setBuscandoAlumnos(true);
-        const alumnos = await getAlumnos(busquedaAlumno);
+        const alumnos = await getAlumnos(busquedaAlumno, { soloInscribibles: true });
         setAlumnosEncontrados(alumnos || []);
       } catch (error) {
         console.error("Error al buscar alumnos:", error);
@@ -255,7 +263,7 @@ export default function NuevoGrupoForm({
           comentario: comentarioGrupo,
           capacidadMaxima: Number(capacidadMaxima),
           Estatus: "Activo",
-          fechaCreacion: toDateInputValue(new Date()),
+          fechaCreacion,
         },
         fechaInscripcion: fechaCreacion,
         datosPago: {
@@ -302,11 +310,28 @@ export default function NuevoGrupoForm({
         duration: 4000,
       });
 
-      if (onSuccess) {
-        onSuccess();
-      }
+      const nombreAlumnoFinal =
+        modoAlumno === "existente"
+          ? alumnoSeleccionado?.nombreAlumno || ""
+          : nombreAlumnoNuevo.trim();
+      const prof = normalizarProfesorContacto(profesorSeleccionado);
+      const grupo = respuesta?.grupo || {};
+      const idGrupo = grupo.IdGrupo || grupo.idGrupo || grupo.GrupoId || "";
+      const avisos: ItemWhatsAppCola[] = [];
+      const combinado = avisoGrupoAsignacionEInscripcion(prof, {
+        nombreCurso: cursoSeleccionado.nombreCurso,
+        idGrupo: String(idGrupo),
+        diaClase,
+        horaClase,
+        nombreAlumno: nombreAlumnoFinal,
+        fechaInscripcion: fechaCreacion,
+      });
+      if (combinado) avisos.push(combinado);
 
-      onClose();
+      colaWhatsApp.iniciar(avisos, () => {
+        onSuccess?.();
+        onClose();
+      });
     } catch (error: any) {
       console.error("Error al crear grupo con alumno:", error);
       
@@ -339,6 +364,8 @@ export default function NuevoGrupoForm({
   }
 
   return (
+    <>
+      <WhatsAppColaHost {...colaWhatsApp} />
     <div className="fixed inset-0 bg-black/40 flex justify-center items-center z-50">
       <div className="bg-white w-[95vw] max-w-6xl rounded-xl p-6 shadow-lg max-h-[90vh] overflow-y-auto">
         <h2 className="text-xl font-bold mb-2">Crear grupo nuevo e inscribir alumno</h2>
@@ -620,7 +647,7 @@ export default function NuevoGrupoForm({
 
               <div>
                 <label className="block text-sm font-medium text-gray-700 mb-1">
-                  Teléfono
+                  Teléfono del tutor (WhatsApp)
                 </label>
                 <input
                   type="text"
@@ -632,7 +659,7 @@ export default function NuevoGrupoForm({
 
               <div>
                 <label className="block text-sm font-medium text-gray-700 mb-1">
-                  Tutor
+                  Nombre del tutor
                 </label>
                 <input
                   type="text"
@@ -734,5 +761,6 @@ export default function NuevoGrupoForm({
         </div>
       </div>
     </div>
+    </>
   );
 }

@@ -1,12 +1,31 @@
-﻿import React, { useCallback, useEffect, useState } from 'react';
+﻿import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { Navbar } from '../components/Navbar';
 import { PaymentRow } from '../components/PaymentRow';
 import { RegisterPaymentModal } from '../components/RegisterPaymentModal';
-import { getPagosConEstatus, registrarAbono, actualizarDiaPago } from '../../services/api';
-import { toast } from "sonner";
+import { getPagosConEstatus, registrarAbono, actualizarDiaPago, actualizarMontoMensualidad } from '../../services/api';
 import { useSyncDataReload } from '../../utils/dataSync';
+import { toast } from "sonner";
 import jsPDF from 'jspdf';
 import autoTable from 'jspdf-autotable';
+
+function periodoDelMesCalendario(
+    periodos: any[],
+    mes: number,
+    anio: number
+) {
+    return (periodos || []).find((m: any) => {
+        if (!m.vencimiento) return false;
+        const v = new Date(m.vencimiento);
+        return v.getMonth() === mes && v.getFullYear() === anio;
+    });
+}
+
+function formatearKpi(monto: number) {
+    return `$${Number(monto || 0).toLocaleString('es-MX', {
+        minimumFractionDigits: 0,
+        maximumFractionDigits: 0,
+    })}`;
+}
 
 export function PagosPage() {
     const [pagos, setPagos] = useState<any[]>([]);
@@ -20,6 +39,9 @@ export function PagosPage() {
     const [fechaInicio, setFechaInicio] = useState('');
     const [fechaFin, setFechaFin] = useState('');
     const [criterioFechaPagados, setCriterioFechaPagados] = useState<'limite' | 'real'>('real');
+    const [modalMensualidades, setModalMensualidades] = useState<any | null>(null);
+    const [montosDraft, setMontosDraft] = useState<Record<string, string>>({});
+    const [guardandoMontos, setGuardandoMontos] = useState(false);
 
     const cargarDatos = useCallback(() => {
         getPagosConEstatus()
@@ -30,56 +52,114 @@ export function PagosPage() {
                     const key = pago.nombreAlumno?.trim();
                     if (!key) return;
 
+                    const alumnoBaja =
+                        pago.activo === false ||
+                        String(pago.status || "").trim().toLowerCase() === "baja";
+                    const cursoInactivo = pago.cursoActivo === false;
+
                     if (!alumnosMap[key]) {
                         alumnosMap[key] = {
                             id: pago.id || pago.pagoId,
+                            idAlumno: pago.idAlumno || "",
                             nombreAlumno: pago.nombreAlumno,
+                            telefonoTutor: pago.telefonoTutor || "",
+                            nombreTutor: pago.nombreTutor || "",
                             cursosLista: [],
                             montoTotal: 0,
                             montoPagado: 0,
+                            montoPagadoHistorico: 0,
                             saldo: 0,
                             activo: false,
                             fechaLimite: pago.fechaLimite,
                             fechaPagoReal: pago.fechaPagoReal,
                             metodoAbono: pago.metodoAbono,
-                            periodosMap: {}
+                            periodosMap: {},
+                            periodosHistoricoMap: {},
+                            cursosDetalle: [] as any[],
                         };
                     }
 
                     const alum = alumnosMap[key];
 
-                    if (!alum.cursosLista.includes(pago.nombreCurso)) {
-                        alum.cursosLista.push(pago.nombreCurso);
+                    alum.cursosDetalle.push({
+                        pagoId: pago.id || pago.pagoId,
+                        idAlumno: pago.idAlumno || "",
+                        grupoId: pago.grupoId || "",
+                        nombreCurso: pago.nombreCurso || "Curso",
+                        montoMensualidad: Number(pago.montoTotal) || 0,
+                        cobranzaActiva: !alumnoBaja && !cursoInactivo,
+                    });
+
+                    if (!alum.telefonoTutor && pago.telefonoTutor) {
+                        alum.telefonoTutor = pago.telefonoTutor;
+                        alum.nombreTutor = pago.nombreTutor || alum.nombreTutor;
                     }
 
-                    // Consolidación financiera multi-materia
-                    alum.montoTotal += (Number(pago.montoTotal) || 0);
-                    alum.montoPagado += (Number(pago.montoPagado) || 0);
-                    if (pago.activo !== false) alum.activo = true;
-
                     const periodos = pago.periodosMensuales || [];
-                    periodos.forEach((mes: any) => {
-                        const mesKey = mes.clave;
-                        if (!alum.periodosMap[mesKey]) {
-                            alum.periodosMap[mesKey] = {
-                                clave: mes.clave,
-                                nombreMes: mes.nombreMes,
-                                vencimiento: mes.vencimiento,
-                                monto: 0,
-                                pagado: 0,
-                                saldo: 0,
-                                status: "Pendiente"
-                            };
+
+                    if (alumnoBaja || cursoInactivo) {
+                        alum.montoPagadoHistorico += Number(pago.montoPagado || 0);
+                        periodos.forEach((mes: any) => {
+                            const mesKey = mes.clave;
+                            if (!alum.periodosHistoricoMap[mesKey]) {
+                                alum.periodosHistoricoMap[mesKey] = {
+                                    clave: mes.clave,
+                                    nombreMes: mes.nombreMes,
+                                    vencimiento: mes.vencimiento,
+                                    monto: 0,
+                                    pagado: 0,
+                                    saldo: 0,
+                                    status: "Pendiente",
+                                };
+                            }
+                            if (Number(mes.pagado) > 0 || mes.status === "Pagado") {
+                                alum.periodosHistoricoMap[mesKey].pagado += Number(mes.pagado) || 0;
+                                alum.periodosHistoricoMap[mesKey].monto += Number(mes.monto) || 0;
+                                alum.periodosHistoricoMap[mesKey].saldo = Math.max(
+                                    0,
+                                    alum.periodosHistoricoMap[mesKey].monto -
+                                        alum.periodosHistoricoMap[mesKey].pagado
+                                );
+                                alum.periodosHistoricoMap[mesKey].status =
+                                    alum.periodosHistoricoMap[mesKey].saldo < 0.01
+                                        ? "Pagado"
+                                        : "Parcial";
+                            }
+                        });
+                    } else {
+                        alum.activo = true;
+                        if (!alum.cursosLista.includes(pago.nombreCurso)) {
+                            alum.cursosLista.push(pago.nombreCurso);
                         }
-                        // Sumamos la tarifa requerida de este mes para todas sus materias
-                        alum.periodosMap[mesKey].monto += (Number(mes.monto) || 0);
-                    });
+                        alum.montoTotal += Number(pago.montoTotal) || 0;
+                        alum.montoPagado += Number(pago.montoPagado) || 0;
+
+                        periodos.forEach((mes: any) => {
+                            const mesKey = mes.clave;
+                            if (!alum.periodosMap[mesKey]) {
+                                alum.periodosMap[mesKey] = {
+                                    clave: mes.clave,
+                                    nombreMes: mes.nombreMes,
+                                    vencimiento: mes.vencimiento,
+                                    monto: 0,
+                                    pagado: 0,
+                                    saldo: 0,
+                                    status: "Pendiente",
+                                };
+                            }
+                            alum.periodosMap[mesKey].monto += Number(mes.monto) || 0;
+                        });
+                    }
                 });
 
                 const pagosAgrupados = Object.values(alumnosMap).map((alum: any) => {
                     const periodosMensuales = Object.values(alum.periodosMap).sort((a: any, b: any) => {
                         return new Date(a.vencimiento).getTime() - new Date(b.vencimiento).getTime();
                     });
+                    const periodosHistorico = Object.values(alum.periodosHistoricoMap || {}).sort(
+                        (a: any, b: any) =>
+                            new Date(a.vencimiento).getTime() - new Date(b.vencimiento).getTime()
+                    );
 
                     // -----------------------------------------------------------------
                     // ALGORITMO DE DISTRIBUCIÓN EN CASCADA UNIFICADO (FRONTEND)
@@ -110,7 +190,28 @@ export function PagosPage() {
                     alum.status = !tienePendientes ? "Pagado" : (alum.montoPagado > 0 ? "Parcial" : "Pendiente");
                     alum.saldo = alum.montoTotal - alum.montoPagado;
                     alum.periodosMensuales = periodosMensuales;
-                    alum.nombreCurso = alum.cursosLista.join(", ");
+                    alum.periodosHistorico = periodosHistorico;
+                    alum.nombreCurso = alum.cursosDetalle
+                        .map((c: any) => c.nombreCurso)
+                        .filter(Boolean)
+                        .join(", ") || alum.cursosLista.join(", ");
+
+                    const hoy = new Date();
+                    const periodoVigente =
+                        periodosMensuales.find((m: any) => {
+                            const v = new Date(m.vencimiento);
+                            return (
+                                v.getMonth() === hoy.getMonth() &&
+                                v.getFullYear() === hoy.getFullYear()
+                            );
+                        }) ||
+                        periodosMensuales.find((m: any) => m.status !== "Pagado") ||
+                        periodosMensuales[0];
+
+                    if (periodoVigente) {
+                        alum.mesCobroVigente = periodoVigente.nombreMes;
+                        alum.fechaLimite = periodoVigente.vencimiento;
+                    }
 
                     return alum;
                 });
@@ -410,6 +511,40 @@ export function PagosPage() {
         } catch (error: any) { toast.error("Error al registrar: " + error.message); }
     };
 
+    const abrirModalMensualidades = (payment: any) => {
+        const draft: Record<string, string> = {};
+        for (const curso of payment.cursosDetalle || []) {
+            if (curso.pagoId) {
+                draft[curso.pagoId] = String(curso.montoMensualidad ?? "");
+            }
+        }
+        setMontosDraft(draft);
+        setModalMensualidades(payment);
+    };
+
+    const handleGuardarMensualidades = async () => {
+        if (!modalMensualidades?.cursosDetalle?.length) return;
+        setGuardandoMontos(true);
+        try {
+            for (const curso of modalMensualidades.cursosDetalle) {
+                const monto = Number(montosDraft[curso.pagoId]);
+                if (!Number.isFinite(monto) || monto <= 0) {
+                    throw new Error(`Monto inválido para ${curso.nombreCurso}`);
+                }
+                if (monto !== Number(curso.montoMensualidad)) {
+                    await actualizarMontoMensualidad(curso.pagoId, monto);
+                }
+            }
+            toast.success("Mensualidades actualizadas");
+            setModalMensualidades(null);
+            cargarDatos();
+        } catch (error: any) {
+            toast.error(error.message || "Error al actualizar mensualidades");
+        } finally {
+            setGuardandoMontos(false);
+        }
+    };
+
     const pagosFiltrados = pagos
         .filter(p => {
             const periodos = p.periodosMensuales || [];
@@ -428,11 +563,15 @@ export function PagosPage() {
             });
 
             if (vista === 'control') {
-                return p.activo !== false && tienePendientesPasados;
+                return p.activo !== false && (p.periodosMensuales || []).length > 0 && tienePendientesPasados;
             } else if (vista === 'registro') {
-                return periodos.some((m: any) => m.status === "Pagado") || (p.activo === false && Number(p.montoPagado || 0) > 0);
+                return (
+                    periodos.some((m: any) => m.status === "Pagado") ||
+                    (p.periodosHistorico || []).some((m: any) => m.status === "Pagado") ||
+                    Number(p.montoPagadoHistorico || 0) > 0
+                );
             } else if (vista === 'proximos') {
-                return p.activo !== false && tieneProximosFuturos;
+                return p.activo !== false && (p.periodosMensuales || []).length > 0 && tieneProximosFuturos;
             }
             return false;
         })
@@ -459,32 +598,38 @@ export function PagosPage() {
             }
         });
 
-    if (cargando) return <div className="p-10 text-center">Cargando informacion...</div>;
-
     const hoy = new Date();
     const mesActual = hoy.getMonth();
     const anioActual = hoy.getFullYear();
+    const nombreMesActual = hoy.toLocaleDateString('es-MX', {
+        month: 'long',
+        year: 'numeric',
+    });
 
-    const totalPorRecolectar = pagos
-        .filter(p => p.activo !== false)
-        .reduce((sum, p) => {
-            const mesEnCurso = (p.periodosMensuales || []).find((m: any) => {
-                if (!m.vencimiento) return false;
-                const v = new Date(m.vencimiento);
-                return v.getMonth() === mesActual && v.getFullYear() === anioActual;
-            });
-            return sum + (mesEnCurso ? (mesEnCurso.saldo || 0) : 0);
-        }, 0);
+    const kpisMes = useMemo(() => {
+        let porRecolectar = 0;
+        let totalRecolectado = 0;
+        let metaMes = 0;
 
-    const totalRecolectado = pagos
-        .reduce((sum, p) => {
-            const mesEnCurso = (p.periodosMensuales || []).find((m: any) => {
-                if (!m.vencimiento) return false;
-                const v = new Date(m.vencimiento);
-                return v.getMonth() === mesActual && v.getFullYear() === anioActual;
-            });
-            return sum + (mesEnCurso ? (mesEnCurso.pagado || 0) : 0);
-        }, 0);
+        for (const p of pagos) {
+            if (p.activo === false) continue;
+
+            const mesEnCurso = periodoDelMesCalendario(
+                p.periodosMensuales,
+                mesActual,
+                anioActual
+            );
+            if (!mesEnCurso) continue;
+
+            metaMes += Number(mesEnCurso.monto) || 0;
+            totalRecolectado += Number(mesEnCurso.pagado) || 0;
+            porRecolectar += Number(mesEnCurso.saldo) || 0;
+        }
+
+        return { porRecolectar, totalRecolectado, metaMes };
+    }, [pagos, mesActual, anioActual]);
+
+    if (cargando) return <div className="p-10 text-center">Cargando informacion...</div>;
 
     return (
         <div className="bg-gray-50 min-h-screen w-full">
@@ -526,20 +671,65 @@ export function PagosPage() {
                     )}
                 </div>
 
-                <div>
-                    {vista === 'control' && (
-                        <div className="bg-cyan-50 border border-cyan-100 rounded-2xl p-5 flex items-center justify-between max-w-sm shadow-sm">
-                            <div><span className="text-[10px] font-bold text-cyan-600 uppercase tracking-wider">Por recolectar en el mes</span><h2 className="text-2xl font-black text-cyan-900 mt-1">${totalPorRecolectar.toLocaleString('es-MX')}</h2></div>
-                            <span className="text-3xl bg-white p-2 rounded-xl shadow-sm border border-cyan-50">📅</span>
+                {(vista === 'control' || vista === 'registro') && (
+                    <div className="space-y-2">
+                        <p className="text-[10px] font-bold uppercase tracking-wider text-gray-400 px-1">
+                            Resumen de {nombreMesActual}
+                        </p>
+                        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                            <div className="bg-cyan-50 border border-cyan-100 rounded-2xl p-5 flex items-center justify-between shadow-sm">
+                                <div>
+                                    <span className="text-[10px] font-bold text-cyan-600 uppercase tracking-wider">
+                                        Por recolectar en el mes
+                                    </span>
+                                    <h2 className="text-2xl font-black text-cyan-900 mt-1">
+                                        {formatearKpi(kpisMes.porRecolectar)}
+                                    </h2>
+                                    <p className="text-[10px] text-cyan-700/80 mt-1 font-medium">
+                                        Saldo pendiente del mes
+                                    </p>
+                                </div>
+                                <span className="text-3xl bg-white p-2 rounded-xl shadow-sm border border-cyan-50">
+                                    📅
+                                </span>
+                            </div>
+
+                            <div className="bg-emerald-50 border border-emerald-100 rounded-2xl p-5 flex items-center justify-between shadow-sm">
+                                <div>
+                                    <span className="text-[10px] font-bold text-emerald-600 uppercase tracking-wider">
+                                        Total recolectado en el mes
+                                    </span>
+                                    <h2 className="text-2xl font-black text-emerald-900 mt-1">
+                                        {formatearKpi(kpisMes.totalRecolectado)}
+                                    </h2>
+                                    <p className="text-[10px] text-emerald-700/80 mt-1 font-medium">
+                                        Abonos registrados en el mes
+                                    </p>
+                                </div>
+                                <span className="text-3xl bg-white p-2 rounded-xl shadow-sm border border-emerald-50">
+                                    💰
+                                </span>
+                            </div>
+
+                            <div className="bg-indigo-50 border border-indigo-100 rounded-2xl p-5 flex items-center justify-between shadow-sm">
+                                <div>
+                                    <span className="text-[10px] font-bold text-indigo-600 uppercase tracking-wider">
+                                        Meta del mes
+                                    </span>
+                                    <h2 className="text-2xl font-black text-indigo-900 mt-1">
+                                        {formatearKpi(kpisMes.metaMes)}
+                                    </h2>
+                                    <p className="text-[10px] text-indigo-700/80 mt-1 font-medium">
+                                        Total si todos pagan su mensualidad
+                                    </p>
+                                </div>
+                                <span className="text-3xl bg-white p-2 rounded-xl shadow-sm border border-indigo-50">
+                                    🎯
+                                </span>
+                            </div>
                         </div>
-                    )}
-                    {vista === 'registro' && (
-                        <div className="bg-emerald-50 border border-emerald-100 rounded-2xl p-5 flex items-center justify-between max-w-sm shadow-sm">
-                            <div><span className="text-[10px] font-bold text-emerald-600 uppercase tracking-wider">Total recolectado del mes</span><h2 className="text-2xl font-black text-emerald-900 mt-1">${totalRecolectado.toLocaleString('es-MX')}</h2></div>
-                            <span className="text-3xl bg-white p-2 rounded-xl shadow-sm border border-emerald-50">💰</span>
-                        </div>
-                    )}
-                </div>
+                    </div>
+                )}
 
                 <div className="flex flex-col gap-4">
                     {pagosFiltrados.length > 0 ? (
@@ -553,6 +743,7 @@ export function PagosPage() {
                                     setIsModalOpen(true);
                                 }}
                                 onChangePaymentDate={() => { }}
+                                onEditMensualidades={() => abrirModalMensualidades(p)}
                                 onPrintReceipt={(mes) => handleImprimirRecibo(p, mes)}
                             />
                         ))
@@ -569,6 +760,65 @@ export function PagosPage() {
                         onClose={() => setIsModalOpen(false)}
                         onConfirm={handleConfirmarPago}
                     />
+                )}
+
+                {modalMensualidades && (
+                    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 backdrop-blur-sm p-4">
+                        <div className="bg-white rounded-2xl shadow-xl w-full max-w-lg overflow-hidden">
+                            <div className="bg-cyan-600 px-6 py-4">
+                                <h2 className="text-white font-black text-lg">Editar mensualidades</h2>
+                                <p className="text-cyan-100 text-xs font-medium mt-0.5">
+                                    {modalMensualidades.nombreAlumno}
+                                </p>
+                            </div>
+                            <div className="p-6 space-y-4 max-h-[60vh] overflow-y-auto">
+                                {(modalMensualidades.cursosDetalle || []).map((curso: any) => (
+                                    <div key={curso.pagoId} className="rounded-xl border border-gray-200 p-4 space-y-2">
+                                        <div className="text-sm font-black text-gray-900">{curso.nombreCurso}</div>
+                                        <div className="text-[10px] text-gray-500">Grupo: {curso.grupoId}</div>
+                                        <div className="flex items-center gap-2">
+                                            <span className="text-xs font-bold text-gray-500">$</span>
+                                            <input
+                                                type="number"
+                                                min="1"
+                                                step="0.01"
+                                                value={montosDraft[curso.pagoId] ?? ""}
+                                                onChange={(e) =>
+                                                    setMontosDraft((prev) => ({
+                                                        ...prev,
+                                                        [curso.pagoId]: e.target.value,
+                                                    }))
+                                                }
+                                                className="flex-1 rounded-xl border border-gray-200 bg-gray-50 px-3 py-2 text-sm font-bold focus:outline-none focus:border-cyan-400"
+                                            />
+                                        </div>
+                                        {!curso.cobranzaActiva ? (
+                                            <p className="text-[10px] text-amber-700 font-medium">
+                                                Curso inactivo o alumno en baja: no aparece en control de cobranza.
+                                            </p>
+                                        ) : null}
+                                    </div>
+                                ))}
+                            </div>
+                            <div className="px-6 py-4 border-t border-gray-100 flex justify-end gap-3">
+                                <button
+                                    type="button"
+                                    onClick={() => setModalMensualidades(null)}
+                                    className="px-4 py-2 rounded-xl text-xs font-bold text-gray-600 bg-gray-100 hover:bg-gray-200"
+                                >
+                                    Cancelar
+                                </button>
+                                <button
+                                    type="button"
+                                    disabled={guardandoMontos}
+                                    onClick={handleGuardarMensualidades}
+                                    className="px-4 py-2 rounded-xl text-xs font-black text-white bg-cyan-600 hover:bg-cyan-700 disabled:opacity-50"
+                                >
+                                    {guardandoMontos ? "Guardando..." : "Guardar cambios"}
+                                </button>
+                            </div>
+                        </div>
+                    </div>
                 )}
             </div>
         </div>

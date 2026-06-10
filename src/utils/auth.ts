@@ -6,12 +6,14 @@ export interface UsuarioSesion {
   usuario?: string;
   nombreCompleto?: string;
   rol?: RolUsuario | string;
+  idProfesor?: string;
 }
 
 export function getUsuario(): UsuarioSesion | null {
   try {
     const raw = localStorage.getItem("user");
-    return raw ? (JSON.parse(raw) as UsuarioSesion) : null;
+    if (!raw) return null;
+    return JSON.parse(raw) as UsuarioSesion;
   } catch {
     return null;
   }
@@ -27,6 +29,10 @@ export function esAdmin(): boolean {
 
 export function esProfesor(): boolean {
   return getRol() === "profesor";
+}
+
+export function getIdProfesorSesion(): string {
+  return String(getUsuario()?.idProfesor || "").trim();
 }
 
 /** Ruta inicial según el rol tras iniciar sesión. */

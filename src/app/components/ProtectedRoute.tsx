@@ -26,7 +26,7 @@ export function ProtectedRoute({ children, allowedRoles }: ProtectedRouteProps) 
     }
 
     // Si el rol no coincide, mandamos al calendario (vista permitida para todos)
-    if (allowedRoles && !allowedRoles.includes(user.rol)) {
+    if (allowedRoles && !allowedRoles.map((r) => r.toLowerCase()).includes(String(user.rol || '').toLowerCase())) {
         return <Navigate to="/dashboard" replace />;
     }
 

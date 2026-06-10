@@ -2,6 +2,7 @@ import React from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { CalendarDays, CreditCard, LogOut, Users } from 'lucide-react';
 import { toast } from 'sonner';
+import { CampanaNotificacionesProfesor } from './CampanaNotificacionesProfesor';
 
 export function Navbar() {
     const navigate = useNavigate();
@@ -10,6 +11,7 @@ export function Navbar() {
     const userStorage = localStorage.getItem('user');
     const user = userStorage ? JSON.parse(userStorage) : null;
     const esAdmin = String(user?.rol || '').toLowerCase() === 'admin';
+    const esProfesor = String(user?.rol || '').toLowerCase() === 'profesor';
 
     const handleLogout = () => {
         localStorage.clear();
@@ -65,6 +67,7 @@ export function Navbar() {
                 </div>
 
                 <div className="flex min-w-0 items-center justify-end gap-3">
+                    {esProfesor ? <CampanaNotificacionesProfesor /> : null}
                     <div className="hidden min-w-0 flex-col text-right sm:flex">
                         <span className="max-w-56 truncate text-xs font-black text-gray-900">
                             {user?.nombreCompleto || 'Usuario'}

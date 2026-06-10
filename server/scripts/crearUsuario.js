@@ -6,9 +6,10 @@
  *
  * Ejemplos:
  *   node server/scripts/crearUsuario.js admin.goku Secret123 "Administrador Goku" admin
- *   node server/scripts/crearUsuario.js maestro.juan Clase123 "Juan Pérez" profesor
+ *   node server/scripts/crearUsuario.js maestro.juan Clase123 "Juan Pérez" profesor PROF001
  *
  * Roles válidos: admin | profesor | recepcion
+ * Para profesor, el 5º argumento idProfesor es obligatorio (ej. PROF001).
  */
 import "dotenv/config";
 import dotenv from "dotenv";
@@ -22,11 +23,12 @@ dotenv.config({ path: "./server/.env" });
 const ROLES_VALIDOS = ["admin", "profesor", "recepcion"];
 
 async function main() {
-  const [, , usuarioArg, passwordArg, nombreArg, rolArg] = process.argv;
+  const [, , usuarioArg, passwordArg, nombreArg, rolArg, idProfesorArg] =
+    process.argv;
 
   if (!usuarioArg || !passwordArg || !nombreArg || !rolArg) {
     console.error(
-      'Uso: node server/scripts/crearUsuario.js <usuario> <password> "<Nombre Completo>" <rol>'
+      'Uso: node server/scripts/crearUsuario.js <usuario> <password> "<Nombre Completo>" <rol> [idProfesor]'
     );
     process.exit(1);
   }
@@ -34,6 +36,14 @@ async function main() {
   const rol = String(rolArg).toLowerCase();
   if (!ROLES_VALIDOS.includes(rol)) {
     console.error(`Rol inválido "${rolArg}". Usa uno de: ${ROLES_VALIDOS.join(", ")}`);
+    process.exit(1);
+  }
+
+  const idProfesor = String(idProfesorArg || "").trim();
+  if (rol === "profesor" && !idProfesor) {
+    console.error(
+      'Para rol profesor debes indicar el idProfesor del catálogo (ej. PROF001)'
+    );
     process.exit(1);
   }
 
@@ -48,6 +58,7 @@ async function main() {
     existente.password = passwordHash;
     existente.nombreCompleto = nombreArg;
     existente.rol = rol;
+    if (rol === "profesor") existente.idProfesor = idProfesor;
     await existente.save();
     console.log(`Usuario actualizado: ${usuario} (rol: ${rol})`);
   } else {
@@ -56,6 +67,7 @@ async function main() {
       password: passwordHash,
       nombreCompleto: nombreArg,
       rol,
+      ...(rol === "profesor" ? { idProfesor } : {}),
     });
     console.log(`Usuario creado: ${usuario} (rol: ${rol})`);
   }

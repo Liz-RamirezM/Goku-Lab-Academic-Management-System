@@ -7,6 +7,7 @@ export async function generarId(tipo) {
     grupo: { prefijo: "GRU", digitos: 3 },
     profesor: { prefijo: "PROF", digitos: 3 },
     reagendacion: { prefijo: "REA", digitos: 3 },
+    notificacion: { prefijo: "NOT", digitos: 4 },
   };
 
   if (!configuracion[tipo]) {

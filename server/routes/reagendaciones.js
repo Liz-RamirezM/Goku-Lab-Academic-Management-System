@@ -8,11 +8,28 @@ import Abono from "../models/Abono.js";
 import { generarId } from "../utils/generarId.js";
 import { parseFechaFlexible } from "../utils/parseFechas.js";
 import { crearPagoId } from "../utils/pagos.js";
-import { notificarReagendacionProfesor } from "../utils/notificaciones.js";
+import {
+  notificarReagendacionProfesor,
+  notificarProfesoresReagendacion,
+} from "../utils/notificaciones.js";
 
 const router = express.Router();
 
 const normalizar = (valor) => String(valor || "").trim().toUpperCase();
+
+async function enviarNotificacionesReagendacion(reagendacionId, datos) {
+  await notificarProfesoresReagendacion(datos);
+  if (reagendacionId && datos.idProfesorOriginal) {
+    await notificarReagendacionProfesor(reagendacionId, datos.idProfesorOriginal);
+  }
+  if (
+    reagendacionId &&
+    datos.idProfesorNuevo &&
+    datos.idProfesorNuevo !== datos.idProfesorOriginal
+  ) {
+    await notificarReagendacionProfesor(reagendacionId, datos.idProfesorNuevo);
+  }
+}
 
 const grupoIdDeInscripcion = (ins) =>
   String(ins?.grupoId || ins?.GrupoId || ins?.idGrupo || ins?.IdGrupo || "").trim();
@@ -340,6 +357,26 @@ router.post("/", async (req, res) => {
           inscripcionesAlumno,
         });
 
+        const [grupoOrigen, grupoDestino] = await Promise.all([
+          buscarGrupoPorId(grupoOrigenCanonico),
+          buscarGrupoPorId(resultado.grupoIdNuevo),
+        ]);
+
+        await notificarProfesoresReagendacion({
+          nombreAlumno: nombreAlumnoFinal,
+          nombreCurso: nombreCurso || "",
+          idGrupoOrigen: grupoOrigenCanonico,
+          idGrupoNuevo: resultado.grupoIdNuevo,
+          idProfesorOriginal: String(
+            idProfesorOriginal || grupoOrigen?.idProfesor || ""
+          ).trim(),
+          idProfesorNuevo: String(
+            idProfesorNuevo || grupoDestino?.idProfesor || ""
+          ).trim(),
+          fechaHoraOriginal: fechaOriginalDate,
+          fechaHoraNueva: fechaNuevaDate,
+        });
+
         return res.status(200).json({
           ok: true,
           permanente: true,
@@ -394,13 +431,10 @@ router.post("/", async (req, res) => {
     if (actualizada) {
       console.log("REAGENDACION ACTUALIZADA:", actualizada);
       
-      // ✅ CAMBIO 6: Notificar al profesor sobre la actualización
-      if (idProfesorOriginal) {
-        await notificarReagendacionProfesor(actualizada.ReagendacionId, idProfesorOriginal);
-      }
-      if (idProfesorNuevo && idProfesorNuevo !== idProfesorOriginal) {
-        await notificarReagendacionProfesor(actualizada.ReagendacionId, idProfesorNuevo);
-      }
+      await enviarNotificacionesReagendacion(
+        actualizada.ReagendacionId,
+        datosReagendacion
+      );
       
       return res.status(200).json(actualizada);
     }
@@ -418,13 +452,7 @@ router.post("/", async (req, res) => {
 
     console.log("REAGENDACION GUARDADA:", guardada);
 
-    // ✅ CAMBIO 6: Notificar al profesor sobre la reagendación
-    if (idProfesorOriginal) {
-      await notificarReagendacionProfesor(nuevoReagendacionId, idProfesorOriginal);
-    }
-    if (idProfesorNuevo && idProfesorNuevo !== idProfesorOriginal) {
-      await notificarReagendacionProfesor(nuevoReagendacionId, idProfesorNuevo);
-    }
+    await enviarNotificacionesReagendacion(nuevoReagendacionId, datosReagendacion);
 
     res.status(201).json(guardada);
   } catch (error) {

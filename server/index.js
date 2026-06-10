@@ -10,6 +10,8 @@ import reagendacionesRoutes from "./routes/reagendaciones.js";
 import calendarioRoutes from "./routes/calendario.js";
 import clasesCanceladasRoutes from "./routes/clases-canceladas.js";
 import notificacionesRoutes from "./routes/notificaciones.js";
+import notificacionesProfesorRoutes from "./routes/notificaciones-profesor.js";
+import notasClaseSesionRoutes from "./routes/notas-clase-sesion.js";
 import pagosRoutes from "./routes/pagos.js";
 import abonosRouter from "./routes/abonos.js";
 import profesoresRoutes from "./routes/profesores.js";
@@ -48,7 +50,7 @@ const apiProtegida = express.Router();
 apiProtegida.use(verifyToken);
 
 // Solo lectura del calendario: accesible para admin y profesor
-apiProtegida.use("/calendario", calendarioRoutes);
+apiProtegida.use("/calendario", requireRole("admin", "profesor"), calendarioRoutes);
 
 // Recursos de administración: exclusivos del rol admin
 const soloAdmin = requireRole("admin");
@@ -57,6 +59,16 @@ apiProtegida.use("/inscripciones", soloAdmin, inscripcionesRoutes);
 apiProtegida.use("/reagendaciones", soloAdmin, reagendacionesRoutes);
 apiProtegida.use("/clases-canceladas", soloAdmin, clasesCanceladasRoutes);
 apiProtegida.use("/notificaciones", soloAdmin, notificacionesRoutes);
+apiProtegida.use(
+  "/notificaciones-profesor",
+  requireRole("admin", "profesor"),
+  notificacionesProfesorRoutes
+);
+apiProtegida.use(
+  "/notas-clase-sesion",
+  requireRole("admin", "profesor"),
+  notasClaseSesionRoutes
+);
 apiProtegida.use("/pagos", soloAdmin, pagosRoutes);
 apiProtegida.use("/abonos", soloAdmin, abonosRouter);
 apiProtegida.use("/profesores", soloAdmin, profesoresRoutes);

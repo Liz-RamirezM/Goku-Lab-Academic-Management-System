@@ -23,9 +23,59 @@ const filtroIdAlumno = (idAlumno) => {
   };
 };
 
+function estatusAlumnoInactivo(estatus) {
+  const e = String(estatus || "Activo").trim().toLowerCase();
+  return e === "inactivo" || e === "baja";
+}
+
+function esInscripcionActiva(estatus) {
+  return String(estatus || "Activa").trim().toLowerCase() !== "baja";
+}
+
+/** Alumno visible al inscribir: activo y con al menos un curso vigente (o sin historial). */
+function alumnoEsInscribible(alumno, resumenInscripciones) {
+  if (estatusAlumnoInactivo(alumno?.estatus)) return false;
+
+  const id = String(alumno?.idAlumno || "").trim();
+  if (!id) return false;
+
+  const stats = resumenInscripciones.get(id);
+  if (!stats) return true;
+  return stats.activas > 0;
+}
+
+async function resumenInscripcionesPorAlumno(idsAlumnos) {
+  const ids = [...new Set(idsAlumnos.map((id) => String(id || "").trim()).filter(Boolean))];
+  const resumen = new Map();
+
+  if (ids.length === 0) return resumen;
+
+  const inscripciones = await Inscripcion.find(
+    { idAlumno: { $in: ids } },
+    { idAlumno: 1, estatus: 1 }
+  ).lean();
+
+  for (const ins of inscripciones) {
+    const id = String(ins.idAlumno || "").trim();
+    if (!id) continue;
+
+    if (!resumen.has(id)) {
+      resumen.set(id, { total: 0, activas: 0 });
+    }
+
+    const stats = resumen.get(id);
+    stats.total += 1;
+    if (esInscripcionActiva(ins.estatus)) {
+      stats.activas += 1;
+    }
+  }
+
+  return resumen;
+}
+
 router.get("/", async (req, res) => {
   try {
-    const { q } = req.query;
+    const { q, paraInscripcion } = req.query;
 
     let filtro = {};
 
@@ -81,7 +131,22 @@ router.get("/", async (req, res) => {
       (alumno) => alumno.nombreAlumno
     );
 
-    res.status(200).json(alumnosUnicos);
+    let alumnosRespuesta = alumnosUnicos;
+
+    const soloInscribibles =
+      paraInscripcion === "1" ||
+      String(paraInscripcion || "").toLowerCase() === "true";
+
+    if (soloInscribibles) {
+      const resumen = await resumenInscripcionesPorAlumno(
+        alumnosUnicos.map((a) => a.idAlumno)
+      );
+      alumnosRespuesta = alumnosUnicos.filter((alumno) =>
+        alumnoEsInscribible(alumno, resumen)
+      );
+    }
+
+    res.status(200).json(alumnosRespuesta);
   } catch (error) {
     console.error("ERROR GET ALUMNOS:", error);
     res.status(500).json({
@@ -157,6 +222,7 @@ router.patch("/:idAlumno", async (req, res) => {
     const telefono = req.body?.telefono;
     const tutor = req.body?.tutor;
     const estatus = req.body?.estatus;
+    const nombreAlumno = req.body?.nombreAlumno;
 
     const update = {};
     if (telefono !== undefined) update.telefono = String(telefono || "").trim();
@@ -165,22 +231,42 @@ router.patch("/:idAlumno", async (req, res) => {
     if (req.body?.observaciones !== undefined) {
       update.observaciones = String(req.body?.observaciones || "").trim();
     }
+    if (nombreAlumno !== undefined) {
+      const nombreLimpio = String(nombreAlumno || "").trim();
+      if (!nombreLimpio) {
+        return res.status(400).json({ error: "El nombre del alumno no puede estar vacío" });
+      }
+      update.nombreAlumno = nombreLimpio;
+      update.nombre = nombreLimpio;
+    }
+
+    const filtroAlumno = {
+      $or: [
+        { idAlumno: idTrimmed },
+        { "idAlumno ": idTrimmed },
+        { IdAlumno: idTrimmed },
+        { id_alumno: idTrimmed },
+      ],
+    };
 
     const actualizado = await Alumno.findOneAndUpdate(
-      {
-        $or: [
-          { idAlumno: idTrimmed },
-          { "idAlumno ": idTrimmed },
-          { IdAlumno: idTrimmed },
-          { id_alumno: idTrimmed },
-        ],
-      },
+      filtroAlumno,
       { $set: update },
       { new: true }
     ).lean();
 
     if (!actualizado) {
       return res.status(404).json({ error: "No se encontró el alumno" });
+    }
+
+    if (update.nombreAlumno) {
+      const filtroInscripcion = filtroIdAlumno(idTrimmed);
+      await Inscripcion.updateMany(filtroInscripcion, {
+        $set: { nombreAlumno: update.nombreAlumno },
+      });
+      await Pago.updateMany(filtroInscripcion, {
+        $set: { nombreAlumno: update.nombreAlumno },
+      });
     }
 
     res.status(200).json({

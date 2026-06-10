@@ -29,7 +29,7 @@ export const router = createBrowserRouter([
     {
         path: '/reschedule',
         element: (
-            <ProtectedRoute>
+            <ProtectedRoute allowedRoles={['admin']}>
                 <ReschedulingFlow />
             </ProtectedRoute>
         ),

@@ -21,6 +21,8 @@ const inscripcionSchema = new mongoose.Schema(
       description: "Primer mes desde el cual comienza a aplicar el pago"
     },
     comentarios: { type: String, default: "" },
+    /** Notas del alumno en este curso (después de inscribirse; visible en calendario) */
+    comentarioAlumno: { type: String, default: "" },
     // Fecha efectiva desde la cual el alumno debe aparecer en el calendario.
     // Si no se envía, se usa la fecha en que se guarda la inscripción.
     // ✅ SIEMPRE es Date (ISO 8601), nunca string

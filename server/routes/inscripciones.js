@@ -9,10 +9,16 @@ import Abono from "../models/Abono.js";
 import {
   crearOActualizarPagoDeInscripcion,
   crearPagoId,
+  desactivarPagoDeInscripcion,
+  reactivarPagoDeInscripcion,
+  actualizarMontoMensualidadAlumnoGrupo,
   normalizarDatosPago,
   validarMesPrimerCobro,
   validarPagoAlCorrienteParaBaja,
 } from "../utils/pagos.js";
+import { crearNotificacionInscripcionProfesor } from "../utils/notificaciones.js";
+import { sincronizarInscripcionesHuerfanas } from "../utils/grupoInscripcion.js";
+import { sincronizarInscripcionesConCursosCatalogo } from "../utils/inscripcionesCurso.js";
 
 const router = express.Router();
 
@@ -41,8 +47,30 @@ async function buscarInscripcionPorAlumnoYGrupo(idAlumno, grupoId) {
   );
 }
 
+/** Campos de pago en inscripciones antiguas (diaPagoFijo, fechaPago) */
+async function resolverCamposPagoInscripcion(inscripcionDoc) {
+  const raw = await Inscripcion.collection.findOne({ _id: inscripcionDoc._id });
+
+  const diaPago =
+    inscripcionDoc.diaPago ??
+    raw?.diaPago ??
+    raw?.diaPagoFijo ??
+    null;
+
+  const fechaInicioPago =
+    inscripcionDoc.fechaInicioPago ??
+    raw?.fechaInicioPago ??
+    raw?.fechaPago ??
+    inscripcionDoc.fechaInscripcion ??
+    null;
+
+  return { diaPago, fechaInicioPago };
+}
+
 router.get("/", async (req, res) => {
   try {
+    await sincronizarInscripcionesHuerfanas();
+    await sincronizarInscripcionesConCursosCatalogo();
     const inscripciones = await Inscripcion.find().lean();
     res.json(inscripciones);
   } catch (error) {
@@ -226,6 +254,18 @@ router.post("/", async (req, res) => {
       datosPago: datosPagoNormalizados,
     });
 
+    const idProfesor = String(grupoNuevo?.idProfesor || "").trim();
+    if (idProfesor) {
+      await crearNotificacionInscripcionProfesor(idProfesor, {
+        nombreAlumno: guardada.nombreAlumno,
+        nombreCurso: grupoNuevo?.nombreCurso || "",
+        idGrupo: grupoIdTrimmed,
+        diaClase: grupoNuevo?.diaClase || "",
+        horaClase: grupoNuevo?.horaClase || "",
+        fechaInscripcion: guardada.fechaInscripcion,
+      });
+    }
+
     res.status(201).json({
       ...guardada.toObject(),
       pago,
@@ -278,7 +318,8 @@ router.get("/alumno/:idAlumno", async (req, res) => {
 router.patch("/:idAlumno/:grupoId", async (req, res) => {
   try {
     const { idAlumno, grupoId } = req.params;
-    const { modalidad, comentarios, comentario } = req.body || {};
+    const { modalidad, comentarios, comentario, comentarioAlumno, montoMensualidad } =
+      req.body || {};
 
     if (!idAlumno || !String(idAlumno).trim()) {
       return res.status(400).json({ error: "Falta idAlumno" });
@@ -336,9 +377,24 @@ router.patch("/:idAlumno/:grupoId", async (req, res) => {
       update.comentarios = String(comentarios ?? comentario ?? "").trim();
     }
 
+    if (comentarioAlumno !== undefined) {
+      update.comentarioAlumno = String(comentarioAlumno ?? "").trim();
+    }
+
+    if (montoMensualidad !== undefined) {
+      const monto = Number(montoMensualidad);
+      if (!Number.isFinite(monto) || monto <= 0) {
+        return res.status(400).json({
+          error: "Captura un monto de mensualidad válido (mayor a 0)",
+        });
+      }
+      update.montoMensualidad = monto;
+    }
+
     if (Object.keys(update).length === 0) {
       return res.status(400).json({
-        error: "Indica modalidad y/o comentarios para actualizar",
+        error:
+          "Indica modalidad, comentarios, comentario de alumno y/o mensualidad",
       });
     }
 
@@ -361,6 +417,14 @@ router.patch("/:idAlumno/:grupoId", async (req, res) => {
           ],
         },
         { $set: { modalidad: update.modalidad } }
+      );
+    }
+
+    if (update.montoMensualidad != null) {
+      await actualizarMontoMensualidadAlumnoGrupo(
+        idAlumnoLimpio,
+        grupoCanonico,
+        update.montoMensualidad
       );
     }
 
@@ -411,57 +475,56 @@ router.patch("/:idAlumno/:grupoId/nota", async (req, res) => {
 router.patch("/:idAlumno/:grupoId/reactivar", async (req, res) => {
   try {
     const { idAlumno, grupoId } = req.params;
+    const idTrimmed = String(idAlumno).trim();
 
-    if (!idAlumno || !String(idAlumno).trim()) {
+    if (!idTrimmed) {
       return res.status(400).json({ error: "Falta idAlumno" });
     }
     if (!grupoId || !String(grupoId).trim()) {
       return res.status(400).json({ error: "Falta grupoId" });
     }
 
-    const inscripcion = await Inscripcion.findOne({
-      idAlumno: String(idAlumno).trim(),
-      grupoId: String(grupoId).trim(),
-    });
+    const inscripcionDoc = await buscarInscripcionPorAlumnoYGrupo(
+      idTrimmed,
+      grupoId
+    );
 
-    if (!inscripcion) {
+    if (!inscripcionDoc) {
       return res.status(404).json({ error: "No se encontró la inscripción" });
     }
 
-    if (String(inscripcion.estatus || "").toLowerCase() !== "baja") {
+    if (String(inscripcionDoc.estatus || "").toLowerCase() !== "baja") {
       return res.status(409).json({ error: "La inscripción ya está activa" });
     }
 
-    inscripcion.estatus = "Activa";
-    inscripcion.fechaBaja = null;
-    inscripcion.motivoBaja = "";
-    // Conservar fechaInscripcion (inicio en calendario) y fechaInicioPago (cobro)
+    const grupoCanonico = grupoIdDeInscripcion(inscripcionDoc);
+    const { diaPago, fechaInicioPago } =
+      await resolverCamposPagoInscripcion(inscripcionDoc);
 
-    await inscripcion.save();
+    const update = {
+      estatus: "Activa",
+      fechaBaja: null,
+      motivoBaja: "",
+    };
 
-    // Reactivar pago si existe (día/mes de cobro se cambian solo en Control de pagos)
-    const pago = await Pago.findOneAndUpdate(
-      {
-        $or: [
-          { pagoId: `${String(idAlumno).trim()}-${String(grupoId).trim()}`.toUpperCase() },
-          {
-            idAlumno: String(idAlumno).trim(),
-            grupoId: String(grupoId).trim(),
-          },
-        ],
-      },
-      {
-        $set: {
-          activo: true,
-          fechaBaja: null,
-        },
-      },
-      { new: true }
+    if (diaPago != null && inscripcionDoc.diaPago == null) {
+      update.diaPago = Number(diaPago);
+    }
+    if (fechaInicioPago != null && inscripcionDoc.fechaInicioPago == null) {
+      update.fechaInicioPago = new Date(fechaInicioPago);
+    }
+
+    const inscripcion = await Inscripcion.findByIdAndUpdate(
+      inscripcionDoc._id,
+      { $set: update },
+      { new: true, runValidators: false }
     ).lean();
+
+    const pago = await reactivarPagoDeInscripcion(idTrimmed, grupoCanonico);
 
     res.status(200).json({
       ok: true,
-      inscripcion: inscripcion.toObject(),
+      inscripcion,
       pago: pago || null,
     });
   } catch (error) {
@@ -633,29 +696,24 @@ router.delete("/:idAlumno/:grupoId", async (req, res) => {
     }
 
     const fechaBaja = new Date();
+    const grupoCanonico = grupoIdDeInscripcion(inscripcion);
     const inscripcionBaja = await Inscripcion.findByIdAndUpdate(
       inscripcion._id,
-      { $set: { estatus: "Baja", fechaBaja } },
+      {
+        $set: {
+          estatus: "Baja",
+          fechaBaja,
+          motivoBaja: "Baja manual",
+        },
+      },
       { new: true, runValidators: false }
     );
 
-    let pagoDesactivado = null;
-    const pagoIdBaja =
-      validacionPago.pago?.pagoId || validacionPago.pagoId || null;
-
-    if (validacionPago.pago?._id) {
-      pagoDesactivado = await Pago.findByIdAndUpdate(
-        validacionPago.pago._id,
-        { activo: false, fechaBaja },
-        { new: true }
-      );
-    } else if (pagoIdBaja) {
-      pagoDesactivado = await Pago.findOneAndUpdate(
-        { pagoId: pagoIdBaja },
-        { $set: { activo: false, fechaBaja } },
-        { new: true }
-      );
-    }
+    const pagoDesactivado = await desactivarPagoDeInscripcion(
+      idAlumno,
+      grupoCanonico || grupoId,
+      fechaBaja
+    );
 
     // Eliminar reagendaciones asociadas al grupo de origen
     const resultadoReagendaciones = await Reagendacion.deleteMany({

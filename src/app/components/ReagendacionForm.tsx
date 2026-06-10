@@ -3,7 +3,12 @@ import {
   crearReagendacion,
   getCalendario,
   getProfesores,
+  getAlumnos,
 } from "../../services/api";
+import { construirMensajeRecuperacionClase } from "../../utils/mensajesWhatsApp";
+import { avisoGrupoReagendacion } from "../../utils/avisosWhatsAppProfesor";
+import { useColaWhatsApp } from "../../hooks/useColaWhatsApp";
+import { WhatsAppColaHost } from "./WhatsAppColaHost";
 
 interface ReagendacionFormProps {
   data: any;
@@ -45,6 +50,7 @@ export default function ReagendacionForm({
   const [grupoSugerido, setGrupoSugerido] = useState<any>(null);
   const [buscandoGrupo, setBuscandoGrupo] = useState(false);
   const [profesoresDisponibles, setProfesoresDisponibles] = useState<any[]>([]);
+  const colaWhatsApp = useColaWhatsApp();
 
   const cursoActual = data?.clase?.title || data?.clase?.nombreCurso || "";
   const profesorOriginal =
@@ -71,6 +77,77 @@ export default function ReagendacionForm({
 
   const diaNuevo = useMemo(() => obtenerNombreDia(fecha), [fecha]);
 
+  const nombreAlumno =
+    data?.alumno?.nombreAlumno || data?.alumno?.Alumno || data?.alumno?.nombre || "";
+
+  const telefonoProfesorFinal =
+    profesorSeleccionado?.telefono ||
+    profesoresDisponibles.find((p) => p.idProfesor === idProfesorOriginal)?.telefono ||
+    "";
+
+  const construirMensajeTutor = (fechaOriginalISO: string) =>
+    construirMensajeRecuperacionClase({
+      nombreAlumno,
+      fechaNueva: fecha,
+      horaNueva: hora,
+      nombreProfesor: profesorFinal,
+      telefonoProfesor: telefonoProfesorFinal,
+      modalidad,
+      fechaSesionOriginal: fechaOriginalISO,
+    });
+
+  const abrirColaAvisos = async (fechaOriginalISO: string, alCerrar?: () => void) => {
+    let telefonoTutor = "";
+    try {
+      const alumnos = await getAlumnos(data?.alumno?.idAlumno || "");
+      const alumnoDb =
+        alumnos.find(
+          (a: any) =>
+            String(a.idAlumno || "").trim() ===
+            String(data?.alumno?.idAlumno || "").trim()
+        ) || alumnos[0];
+      telefonoTutor = String(alumnoDb?.telefono || "").trim();
+    } catch {
+      telefonoTutor = "";
+    }
+
+    const [anio, mes, dia] = fecha.split("-").map(Number);
+    const fechaNuevaDate = new Date(anio, mes - 1, dia);
+    const fechaHoraLocal = (d: Date, horaStr: string) => {
+      const [h = 0, m = 0] = horaStr.split(":").map((x) => parseInt(x, 10));
+      const y = d.getFullYear();
+      const mo = String(d.getMonth() + 1).padStart(2, "0");
+      const day = String(d.getDate()).padStart(2, "0");
+      const hh = String(h).padStart(2, "0");
+      const mm = String(m).padStart(2, "0");
+      return `${y}-${mo}-${day}T${hh}:${mm}:00`;
+    };
+    const fechaNuevaISO = fechaHoraLocal(fechaNuevaDate, hora);
+
+    const avisoGrupoProfesores = await avisoGrupoReagendacion({
+      idProfesorOriginal,
+      idProfesorNuevo: idProfesorFinal,
+      nombreAlumno,
+      nombreCurso: cursoActual,
+      fechaHoraOriginal: fechaOriginalISO,
+      fechaHoraNueva: fechaNuevaISO,
+    });
+
+    const cola = [
+      {
+        titulo: "Aviso al tutor — clase de recuperación",
+        mensaje: construirMensajeTutor(fechaOriginalISO),
+        telefono: telefonoTutor || undefined,
+        destinatarioLabel: telefonoTutor
+          ? `Teléfono del tutor: ${telefonoTutor}`
+          : "Sin teléfono registrado — elige el contacto en WhatsApp",
+      },
+      ...(avisoGrupoProfesores ? [avisoGrupoProfesores] : []),
+    ];
+
+    colaWhatsApp.iniciar(cola, alCerrar);
+  };
+
   useEffect(() => {
     const cargarProfesores = async () => {
       try {
@@ -85,6 +162,7 @@ export default function ReagendacionForm({
             idProfesor:
               prof.idProfesor || prof.IdProfesor || prof.profesorId || "",
             nombre: String(prof.nombre || prof.nombreProfesor || "").trim(),
+            telefono: String(prof.telefono || "").trim(),
           }))
           .filter((prof: any) => prof.idProfesor && prof.nombre);
 
@@ -228,6 +306,11 @@ export default function ReagendacionForm({
       const respuesta = await crearReagendacion(payload);
       console.log("RESPUESTA SERVIDOR:", respuesta);
 
+      const cerrarFlujo = () => {
+        if (onSuccess) onSuccess();
+        else onClose();
+      };
+
       if (respuesta?.permanente) {
         alert(
           respuesta.mensaje ||
@@ -241,11 +324,7 @@ export default function ReagendacionForm({
         );
       }
 
-      if (onSuccess) {
-        onSuccess();
-      } else {
-        onClose();
-      }
+      await abrirColaAvisos(fechaOriginalISO, cerrarFlujo);
     } catch (error: any) {
       console.error("ERROR EN handleSubmit:", error);
       alert(error?.message || "Error al guardar la reagendación");
@@ -255,43 +334,34 @@ export default function ReagendacionForm({
     }
   };
 
-  const handleEnviarMensaje = async () => {
-    const mensaje = `Hola equipo
-
-Se solicita reagendación:
-
-Alumno: ${data?.alumno?.nombreAlumno || data?.alumno?.Alumno || ""}
-Curso: ${cursoActual}
-Profesor actual: ${profesorOriginal}
-Horario original: ${data?.clase?.startTime || ""} - ${data?.clase?.endTime || ""}
-
-Nueva fecha: ${fecha || "[pendiente]"}
-Nueva hora: ${hora || "[pendiente]"}
-Duración: ${duracion}
-Profesor sugerido: ${profesorFinal || "[pendiente]"}
-
-${
-  grupoSugerido
-    ? `Grupo compatible encontrado: ${grupoSugerido.idGrupo}`
-    : "No se encontró grupo compatible. Se creará clase reagendada."
-}
-
-¿Quién puede cubrir esta clase?`;
-
-    try {
-      console.log("Mensaje de WhatsApp generado:", mensaje);
-      await navigator.clipboard.writeText(mensaje);
-      window.open(
-        `https://wa.me/?text=${encodeURIComponent(mensaje)}`,
-        "_blank"
-      );
-    } catch (error) {
-      console.error("Error al generar mensaje:", error);
-      alert("No se pudo generar el mensaje");
+  const handleEnviarMensaje = () => {
+    if (!fecha || !hora) {
+      alert("Selecciona fecha y hora para generar el mensaje");
+      return;
     }
+
+    const fechaOriginal = data.clase.date ? new Date(data.clase.date) : new Date();
+    const horaClaseOrigen = String(data.clase.startTime || "00:00").trim();
+    const [h = 0, m = 0] = horaClaseOrigen.split(":").map((x: string) => parseInt(x, 10));
+    const y = fechaOriginal.getFullYear();
+    const mo = String(fechaOriginal.getMonth() + 1).padStart(2, "0");
+    const day = String(fechaOriginal.getDate()).padStart(2, "0");
+    const hh = String(h).padStart(2, "0");
+    const mm = String(m).padStart(2, "0");
+    const fechaOriginalISO = `${y}-${mo}-${day}T${hh}:${mm}:00`;
+
+    colaWhatsApp.iniciar([
+      {
+        titulo: "Vista previa — aviso de recuperación",
+        mensaje: construirMensajeTutor(fechaOriginalISO),
+        destinatarioLabel: "Mensaje para tutor (editable)",
+      },
+    ]);
   };
 
   return (
+    <>
+      <WhatsAppColaHost {...colaWhatsApp} />
     <div className="fixed inset-0 bg-black/40 flex justify-center items-center z-50">
       <div className="bg-white w-[900px] max-h-[90vh] overflow-y-auto rounded-2xl p-8 shadow-2xl">
         <div className="mb-8">
@@ -340,7 +410,7 @@ ${
           onClick={handleEnviarMensaje}
           className="w-full border border-emerald-200 bg-emerald-50 py-3 rounded-lg mb-6 font-semibold text-emerald-700 hover:bg-emerald-100 transition-colors"
         >
-          WhatsApp Profesores
+          Vista previa del mensaje al tutor
         </button>
 
         <div className="bg-gradient-to-r from-gray-50 to-gray-100 border border-gray-200 p-6 rounded-xl mb-6">
@@ -500,5 +570,6 @@ ${
         </div>
       </div>
     </div>
+    </>
   );
 }

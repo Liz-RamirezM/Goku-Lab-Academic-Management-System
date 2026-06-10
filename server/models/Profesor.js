@@ -4,6 +4,7 @@ const profesorSchema = new mongoose.Schema(
   {
     idProfesor: { type: String, required: true, unique: true },
     nombre: { type: String, required: true },
+    telefono: { type: String, default: "" },
     estatus: { type: String, default: "Activo" },
   },
   {

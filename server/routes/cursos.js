@@ -1,9 +1,13 @@
 import express from "express";
 import Curso from "../models/Curso.js";
 import Grupo from "../models/Grupo.js";
+import Inscripcion from "../models/Inscripcion.js";
 import Counter from "../models/Counter.js";
 import Pago from "../models/Pago.js";
 import { generarId } from "../utils/generarId.js";
+import {
+  sincronizarInscripcionesConCursosCatalogo,
+} from "../utils/inscripcionesCurso.js";
 
 const router = express.Router();
 
@@ -144,7 +148,16 @@ router.patch("/:idCurso/estatus", async (req, res) => {
       return res.status(404).json({ error: "Curso no encontrado" });
     }
 
-    res.status(200).json(curso);
+    const syncInscripciones = await sincronizarInscripcionesConCursosCatalogo();
+
+    const cursoJson =
+      typeof curso.toObject === "function" ? curso.toObject() : curso;
+
+    res.status(200).json({
+      ...cursoJson,
+      inscripcionesInactivadas: syncInscripciones.inactivadas || 0,
+      inscripcionesReactivadas: syncInscripciones.reactivadas || 0,
+    });
   } catch (error) {
     console.error("ERROR PATCH CURSO ESTATUS:", error);
     res.status(500).json({
@@ -169,8 +182,47 @@ router.delete("/:idCurso", async (req, res) => {
     };
 
     const gruposAfectados = await Grupo.find(filtroGrupos)
-      .select("IdGrupo nombreCurso diaClase horaClase")
+      .select("IdGrupo idGrupo GrupoId nombreCurso diaClase horaClase")
       .lean();
+
+    const idsGrupo = gruposAfectados
+      .map((g) =>
+        String(g.IdGrupo || g.idGrupo || g.GrupoId || "").trim()
+      )
+      .filter(Boolean);
+
+    if (idsGrupo.length > 0) {
+      const inscripciones = await Inscripcion.find({
+        $or: idsGrupo.flatMap((id) => [
+          { grupoId: id },
+          { GrupoId: id },
+          { idGrupo: id },
+          { IdGrupo: id },
+        ]),
+      }).lean();
+
+      if (inscripciones.length > 0) {
+        const activas = inscripciones.filter(
+          (ins) => String(ins.estatus || "Activa").trim().toLowerCase() !== "baja"
+        );
+
+        if (activas.length > 0) {
+          return res.status(409).json({
+            error:
+              "No se puede eliminar el curso porque tiene alumnos activos en sus grupos. " +
+              "Primero inactiva a cada alumno en ese curso; el alumno sigue en el sistema y en sus otros cursos.",
+            inscripciones: activas.length,
+            grupos: idsGrupo.length,
+            alumnos: activas.map((ins) => ({
+              idAlumno: ins.idAlumno,
+              nombreAlumno: ins.nombreAlumno,
+              grupoId: ins.grupoId || ins.GrupoId,
+              estatus: ins.estatus || "Activa",
+            })),
+          });
+        }
+      }
+    }
 
     if (gruposAfectados.length > 0) {
       await Grupo.updateMany(filtroGrupos, {

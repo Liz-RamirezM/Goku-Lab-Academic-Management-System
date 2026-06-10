@@ -5,13 +5,24 @@ import Inscripcion from "../models/Inscripcion.js";
 import Reagendacion from "../models/Reagendacion.js";
 import Profesor from "../models/Profesor.js";
 import Curso from "../models/Curso.js";
+import NotaClaseSesion from "../models/NotaClaseSesion.js";
 import { generarId } from "../utils/generarId.js";
 import { parseFechaFlexible } from "../utils/parseFechas.js";
 import {
   crearOActualizarPagoDeInscripcion,
+  limpiarDatosPagosDeGrupo,
   normalizarDatosPago,
   validarMesPrimerCobro,
+  propagarNombreCursoDeGrupo,
 } from "../utils/pagos.js";
+import {
+  eliminarInscripcionesDeGrupo,
+  filtroInscripcionesPorGrupo,
+  idGrupoDeDocumentoGrupo,
+} from "../utils/grupoInscripcion.js";
+import { sincronizarInscripcionesDeGrupo } from "../utils/inscripcionesCurso.js";
+import { parseDuracionAMinutos } from "../utils/duracionClase.js";
+import { crearNotificacionAsignacionGrupo, crearNotificacionInscripcionProfesor } from "../utils/notificaciones.js";
 
 const normalizarHoraClase = (hora) => {
   const texto = String(hora || "").trim();
@@ -22,17 +33,34 @@ const normalizarHoraClase = (hora) => {
 
 const router = express.Router();
 
-const idGrupoDeDocumento = (grupo) =>
-  String(grupo?.IdGrupo || grupo?.idGrupo || grupo?.GrupoId || "").trim();
+function sanitizarNotaHtmlServidor(html) {
+  return String(html || "")
+    .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, "")
+    .replace(/\son\w+\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi, "")
+    .trim();
+}
 
-const filtroInscripcionesPorGrupo = (idGrupo) => ({
-  $or: [
-    { grupoId: idGrupo },
-    { GrupoId: idGrupo },
-    { idGrupo: idGrupo },
-    { IdGrupo: idGrupo },
-  ],
-});
+function normalizarFechaClase(fecha) {
+  const texto = String(fecha || "").trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(texto)) return null;
+  return texto;
+}
+
+async function notificarInscripcionAlProfesor(grupoDoc, inscripcion) {
+  const idProfesor = String(grupoDoc?.idProfesor || "").trim();
+  if (!idProfesor) return;
+
+  await crearNotificacionInscripcionProfesor(idProfesor, {
+    nombreAlumno: inscripcion?.nombreAlumno || "",
+    nombreCurso: grupoDoc?.nombreCurso || "",
+    idGrupo: idGrupoDeDocumento(grupoDoc),
+    diaClase: grupoDoc?.diaClase || "",
+    horaClase: grupoDoc?.horaClase || "",
+    fechaInscripcion: inscripcion?.fechaInscripcion || new Date(),
+  });
+}
+
+const idGrupoDeDocumento = idGrupoDeDocumentoGrupo;
 
 const esInscripcionActiva = (ins) => {
   const estatus = String(ins?.estatus || "Activa").trim().toLowerCase();
@@ -219,12 +247,19 @@ router.post("/crear-con-alumno", async (req, res) => {
         comentario: String(comentario ?? comentarioGrupo ?? "").trim(),
         CapacidadMaxima: capacidadGrupo,
         Estatus: Estatus || estatus || "Activo",
-        // El horario del grupo existe desde hoy; la inscripción controla cuándo aparece el alumno
+        // fechaCreacion = primer día en que el grupo aparece en el calendario
         fechaCreacion: parseFechaFlexible(grupo.fechaCreacion) || new Date(),
       });
 
       grupoGuardado = await nuevoGrupo.save();
       grupoCreado = true;
+
+      if (idProfesor) {
+        await crearNotificacionAsignacionGrupo(
+          idProfesor,
+          grupoGuardado.toObject ? grupoGuardado.toObject() : grupoGuardado
+        );
+      }
     }
 
     const idGrupoFinal = idGrupoDeDocumento(grupoGuardado);
@@ -276,6 +311,13 @@ router.post("/crear-con-alumno", async (req, res) => {
       nombreCurso: grupoGuardado.nombreCurso,
       datosPago: datosPagoNormalizados,
     });
+
+    await notificarInscripcionAlProfesor(
+      grupoGuardado.toObject ? grupoGuardado.toObject() : grupoGuardado,
+      inscripcionGuardada?.toObject
+        ? inscripcionGuardada.toObject()
+        : inscripcionGuardada
+    );
 
     res.status(201).json({
       ok: true,
@@ -331,11 +373,49 @@ router.post("/", async (req, res) => {
 
     const guardado = await nuevoGrupo.save();
 
+    if (idProfesor) {
+      await crearNotificacionAsignacionGrupo(idProfesor, guardado.toObject());
+    }
+
     res.status(201).json(guardado);
   } catch (error) {
     console.error("ERROR POST GRUPOS:", error);
     res.status(500).json({
       error: "Error al crear grupo",
+      detalle: error.message,
+    });
+  }
+});
+
+router.patch("/:grupoId/nota-sesion", async (req, res) => {
+  try {
+    const { grupoId } = req.params;
+    const fechaClase = normalizarFechaClase(req.body?.fecha || req.body?.fechaClase);
+    const notaHtml = sanitizarNotaHtmlServidor(
+      req.body?.notaHtml ?? req.body?.nota ?? req.body?.comentario ?? ""
+    );
+
+    if (!fechaClase) {
+      return res.status(400).json({ error: "Falta fecha válida (YYYY-MM-DD)" });
+    }
+
+    const grupo = await Grupo.findOne(filtroGrupoPorId(grupoId)).lean();
+    if (!grupo) {
+      return res.status(404).json({ error: "No se encontró el grupo" });
+    }
+
+    const idGrupoCanonico = idGrupoDeDocumento(grupo) || String(grupoId).trim();
+    const nota = await NotaClaseSesion.findOneAndUpdate(
+      { idGrupo: idGrupoCanonico, fechaClase },
+      { $set: { notaHtml } },
+      { upsert: true, new: true }
+    ).lean();
+
+    res.json({ ok: true, nota });
+  } catch (error) {
+    console.error("ERROR PATCH NOTA SESION:", error);
+    res.status(500).json({
+      error: "Error al guardar la nota de la clase",
       detalle: error.message,
     });
   }
@@ -375,13 +455,26 @@ router.patch("/:grupoId/comentario", async (req, res) => {
   }
 });
 
+const DIAS_CLASE_VALIDOS = [
+  "Lunes",
+  "Martes",
+  "Miércoles",
+  "Jueves",
+  "Viernes",
+  "Sábado",
+  "Domingo",
+];
+
+const filtroGrupoPorId = (grupoId) => ({
+  $or: [{ IdGrupo: grupoId }, { idGrupo: grupoId }, { GrupoId: grupoId }],
+});
+
 // Reasignar (o quitar) el profesor de un grupo existente
 router.patch("/:grupoId/profesor", async (req, res) => {
   try {
     const { grupoId } = req.params;
     const idProfesor = String(req.body?.idProfesor || "").trim();
 
-    // Si no se manda idProfesor, se deja el grupo sin profesor asignado
     let datosProfesor = { idProfesor: "", nombreProfesor: "" };
 
     if (idProfesor) {
@@ -395,10 +488,10 @@ router.patch("/:grupoId/profesor", async (req, res) => {
       };
     }
 
+    const grupoActual = await Grupo.findOne(filtroGrupoPorId(grupoId)).lean();
+
     const grupo = await Grupo.findOneAndUpdate(
-      {
-        $or: [{ IdGrupo: grupoId }, { idGrupo: grupoId }, { GrupoId: grupoId }],
-      },
+      filtroGrupoPorId(grupoId),
       { $set: datosProfesor },
       { new: true }
     ).lean();
@@ -407,11 +500,108 @@ router.patch("/:grupoId/profesor", async (req, res) => {
       return res.status(404).json({ error: "No se encontró el grupo" });
     }
 
+    const profesorAnterior = String(grupoActual?.idProfesor || "").trim();
+    const profesorNuevo = String(datosProfesor.idProfesor || "").trim();
+    if (profesorNuevo && profesorNuevo !== profesorAnterior) {
+      await crearNotificacionAsignacionGrupo(profesorNuevo, grupo);
+    }
+
     res.status(200).json({ ok: true, grupo });
   } catch (error) {
     console.error("ERROR PATCH PROFESOR GRUPO:", error);
     res.status(500).json({
       error: "Error al reasignar el profesor del grupo",
+      detalle: error.message,
+    });
+  }
+});
+
+// Actualizar día y hora recurrentes del grupo (calendario completo)
+router.patch("/:grupoId/horario", async (req, res) => {
+  try {
+    const { grupoId } = req.params;
+    const diaClase = String(req.body?.diaClase || "").trim();
+    const horaClase = String(req.body?.horaClase || "").trim();
+    const duracionClase = String(req.body?.duracionClase || "").trim();
+
+    if (!diaClase) {
+      return res.status(400).json({ error: "Falta el día de clase" });
+    }
+    if (!horaClase) {
+      return res.status(400).json({ error: "Falta la hora de clase" });
+    }
+
+    const diaValido = DIAS_CLASE_VALIDOS.find(
+      (dia) => dia.toLowerCase() === diaClase.toLowerCase()
+    );
+    if (!diaValido) {
+      return res.status(400).json({ error: "Día de clase inválido" });
+    }
+
+    const horaNormalizada = normalizarHoraClase(horaClase);
+    if (!/^\d{2}:\d{2}$/.test(horaNormalizada)) {
+      return res.status(400).json({ error: "Hora de clase inválida" });
+    }
+
+    if (duracionClase && parseDuracionAMinutos(duracionClase, 0) <= 0) {
+      return res.status(400).json({ error: "Duración de clase inválida" });
+    }
+
+    const grupoActual = await Grupo.findOne(filtroGrupoPorId(grupoId)).lean();
+    if (!grupoActual) {
+      return res.status(404).json({ error: "No se encontró el grupo" });
+    }
+
+    const idGrupoActual = idGrupoDeDocumento(grupoActual);
+    const conflicto = await Grupo.findOne({
+      $and: [
+        {
+          nombreCurso: {
+            $regex: `^${String(grupoActual.nombreCurso || "").trim()}$`,
+            $options: "i",
+          },
+        },
+        { diaClase: { $regex: `^${diaValido}$`, $options: "i" } },
+        {
+          $or: [
+            { horaClase: horaNormalizada },
+            { "horaClase ": horaNormalizada },
+          ],
+        },
+        {
+          $nor: [
+            { IdGrupo: idGrupoActual },
+            { idGrupo: idGrupoActual },
+            { GrupoId: idGrupoActual },
+          ],
+        },
+      ],
+    }).lean();
+
+    if (conflicto) {
+      return res.status(409).json({
+        error: "Ya existe un grupo de este curso con el mismo día y hora",
+      });
+    }
+
+    const grupo = await Grupo.findOneAndUpdate(
+      filtroGrupoPorId(grupoId),
+      {
+        $set: {
+          diaClase: diaValido,
+          horaClase: horaNormalizada,
+          ...(duracionClase ? { duracionClase } : {}),
+        },
+        $unset: { "horaClase ": "" },
+      },
+      { new: true }
+    ).lean();
+
+    res.status(200).json({ ok: true, grupo });
+  } catch (error) {
+    console.error("ERROR PATCH HORARIO GRUPO:", error);
+    res.status(500).json({
+      error: "Error al actualizar el horario del grupo",
       detalle: error.message,
     });
   }
@@ -444,7 +634,24 @@ router.patch("/:grupoId/curso", async (req, res) => {
       return res.status(404).json({ error: "No se encontró el grupo" });
     }
 
-    res.status(200).json({ ok: true, grupo });
+    const syncInscripciones = await sincronizarInscripcionesDeGrupo(
+      grupo.IdGrupo || grupo.idGrupo || grupoId
+    );
+
+    const idGrupoCanonico =
+      grupo.IdGrupo || grupo.idGrupo || grupo.GrupoId || String(grupoId).trim();
+    const pagosCurso = await propagarNombreCursoDeGrupo(
+      idGrupoCanonico,
+      curso.nombreCurso
+    );
+
+    res.status(200).json({
+      ok: true,
+      grupo,
+      inscripcionesInactivadas: syncInscripciones.inactivadas,
+      inscripcionesReactivadas: syncInscripciones.reactivadas,
+      pagosActualizados: pagosCurso.pagosActualizados,
+    });
   } catch (error) {
     console.error("ERROR PATCH CURSO GRUPO:", error);
     res.status(500).json({
@@ -472,12 +679,14 @@ router.delete("/:grupoId", async (req, res) => {
     const filtroGrupo = filtroInscripcionesPorGrupo(idGrupoCanonico);
 
     const inscripciones = await Inscripcion.find(filtroGrupo).lean();
-    const inscripcionesActivas = inscripciones.filter(inscripcionCuentaParaCalendario);
+    const inscripcionesActivas = inscripciones.filter(esInscripcionActiva);
 
     if (inscripcionesActivas.length > 0) {
       return res.status(409).json({
         error:
-          "No se puede eliminar el grupo porque tiene alumnos activos en el calendario",
+          "No se puede eliminar el grupo mientras tenga alumnos activos. " +
+          "Primero inactiva a cada alumno en ese curso (Alumnos inscritos). " +
+          "El alumno sigue en el sistema y en sus otros cursos.",
         alumnosInscritos: inscripcionesActivas.length,
         alumnos: inscripcionesActivas.map((ins) => ({
           idAlumno: ins.idAlumno,
@@ -508,9 +717,21 @@ router.delete("/:grupoId", async (req, res) => {
       });
     }
 
-    if (inscripciones.length > 0) {
-      await Inscripcion.deleteMany(filtroGrupo);
-    }
+    const limpiezaPagos = await limpiarDatosPagosDeGrupo(idGrupoCanonico);
+
+    const inscripcionesEliminadasCount = await eliminarInscripcionesDeGrupo(
+      idGrupoCanonico,
+      String(grupoId).trim()
+    );
+
+    await Reagendacion.deleteMany({
+      $or: [
+        { idGrupoOrigen: idGrupoCanonico },
+        { IdgrupoOrigen: idGrupoCanonico },
+        { idGrupoNuevo: idGrupoCanonico },
+        { IdgrupoNuevo: idGrupoCanonico },
+      ],
+    });
 
     await Grupo.deleteOne({ _id: grupo._id });
 
@@ -518,6 +739,9 @@ router.delete("/:grupoId", async (req, res) => {
       ok: true,
       mensaje: "Grupo eliminado correctamente",
       grupoEliminado: grupo,
+      inscripcionesEliminadas: inscripcionesEliminadasCount,
+      pagosEliminados: limpiezaPagos.pagosEliminados,
+      abonosEliminados: limpiezaPagos.abonosEliminados,
     });
   } catch (error) {
     console.error("ERROR DELETE GRUPO:", error);

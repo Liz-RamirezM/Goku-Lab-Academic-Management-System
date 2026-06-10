@@ -15,7 +15,7 @@ import { Button } from './ui/button';
 import { Card } from './ui/card';
 import { ClassDetailsDialog } from './ClassDetailsDialog';
 import {
-    actualizarComentarioGrupo,
+    actualizarNotaClaseSesion,
     actualizarInscripcionAlumno,
     bajaAlumnoDeGrupo,
     eliminarGrupo,
@@ -25,8 +25,10 @@ import {
 } from '../../services/api';
 import { toast } from 'sonner';
 import { useSyncDataReload } from '../../utils/dataSync';
-import { esAdmin } from '../../utils/auth';
+import { esAdmin, esProfesor, getUsuario } from '../../utils/auth';
 import { resolverGrupoIdInscripcion } from '../../utils/grupoInscripcion';
+import { calcularHoraFinDesdeDuracion } from '../../utils/duracionClase';
+import { fechaClaseClave, sanitizarNotaHtml } from '../../utils/notaClase';
 import ReagendacionForm from './ReagendacionForm';
 import InscripcionForm from './InscripcionForm';
 import NuevoGrupoForm from './NuevoGrupoForm';
@@ -42,7 +44,7 @@ interface StudentItem {
   idAlumno: string;
   nombreAlumno: string;
   modalidad?: string;
-  comentarios?: string;
+  comentarioAlumno?: string;
   inscripcionCreadaEn?: string | null;
   reagendacion?: {
     tipo: 'origen' | 'destino';
@@ -57,6 +59,8 @@ interface CalendarClass {
   date: Date;
   startTime: string;
   endTime: string;
+  diaClase?: string;
+  duracion?: string;
   teacher: {
     name: string;
     email: string;
@@ -77,6 +81,7 @@ interface CalendarClass {
   idCurso?: string;
   cursoActivo?: boolean;
   comentarioGrupo?: string;
+  notaClase?: string;
 }
 
 function normalizar(valor: string) {
@@ -109,30 +114,7 @@ function obtenerFechasDelDiaEnMes(diaClase: string, year: number, month: number)
     return fechas;
 }
 
-function calcularHoraFinDesdeDuracion(horaInicio: string, duracion?: string) {
-    if (!horaInicio) return '';
-    const [horas, minutos] = horaInicio.split(':').map(Number);
-    if (isNaN(horas) || isNaN(minutos)) return '';
-
-    const duracionStr = String(duracion || '2 horas').toLowerCase().trim();
-    let totalMinutos = 0;
-    const matchHoras = duracionStr.match(/(\d+(?:\.\d+)?)\s*horas?/);
-    if (matchHoras) totalMinutos += Number(matchHoras[1]) * 60;
-    const matchMinutos = duracionStr.match(/(\d+)\s*min/);
-    if (matchMinutos) totalMinutos += Number(matchMinutos[1]);
-    if (totalMinutos === 0) totalMinutos = 120;
-
-    let horaFin = horas;
-    let minutoFin = minutos + totalMinutos;
-    while (minutoFin >= 60) {
-        horaFin += 1;
-        minutoFin -= 60;
-    }
-
-    return `${String(horaFin).padStart(2, '0')}:${String(minutoFin).padStart(2, '0')}`;
-}
-
-// Paleta alineada al logo de Goku Lab (azul, cian, verde, amarillo/ámbar, rojo/coral)
+// Paleta alineada al logo de Goku Lab
 // y tonos hermanos. Colores alegres pero no fluorescentes; texto blanco encima.
 const PALETA_GOKU: Array<[number, number, number]> = [
     [205, 72, 48], // Azul Goku
@@ -245,6 +227,8 @@ export function Dashboard() {
     const [isSyncing, setIsSyncing] = useState(false);
     const [reloadKey, setReloadKey] = useState(0);
     const puedeEditar = esAdmin();
+    const esVistaProfesor = esProfesor();
+    const nombreProfesorSesion = getUsuario()?.nombreCompleto || '';
     const navigate = useNavigate();
 
     const recargarCalendario = useCallback(() => {
@@ -351,7 +335,11 @@ export function Dashboard() {
                 alert('No se encontró el grupo');
                 return;
             }
-            const confirmado = window.confirm(`¿Seguro que deseas eliminar el grupo "${classData.title}"?`);
+            const confirmado = window.confirm(
+                `¿Seguro que deseas eliminar el grupo "${classData.title}"?\n\n` +
+                    "Solo se puede eliminar si no quedan alumnos activos en ese grupo. " +
+                    "Si un alumno tiene otros cursos, inactívalo solo en este grupo: sigue en el sistema."
+            );
             if (!confirmado) return;
 
             await eliminarGrupo(grupoId);
@@ -368,7 +356,7 @@ export function Dashboard() {
     const actualizarAlumnoEnClases = (
         idAlumno: string,
         grupoIdInscripcion: string,
-        cambios: { modalidad?: string; comentarios?: string }
+        cambios: { modalidad?: string; comentarioAlumno?: string }
     ) => {
         const aplicar = (students: any[]) =>
             students.map((alumno) => {
@@ -385,8 +373,8 @@ export function Dashboard() {
                     ...(cambios.modalidad !== undefined
                         ? { modalidad: cambios.modalidad }
                         : {}),
-                    ...(cambios.comentarios !== undefined
-                        ? { comentarios: cambios.comentarios }
+                    ...(cambios.comentarioAlumno !== undefined
+                        ? { comentarioAlumno: cambios.comentarioAlumno }
                         : {}),
                 };
             });
@@ -411,7 +399,7 @@ export function Dashboard() {
     const handleActualizarInscripcion = async (
         student: any,
         classData: CalendarClass,
-        datos: { modalidad?: string; comentarios?: string }
+        datos: { modalidad?: string; comentarioAlumno?: string }
     ) => {
         const idGrupoClase = String(classData.idGrupo || '');
         const esGrupoVirtual = idGrupoClase.toUpperCase().startsWith('VIRTUAL_');
@@ -437,13 +425,14 @@ export function Dashboard() {
             const inscripcion = respuesta?.inscripcion || {};
             actualizarAlumnoEnClases(student.idAlumno, grupoId, {
                 modalidad: inscripcion.modalidad ?? datos.modalidad,
-                comentarios: inscripcion.comentarios ?? datos.comentarios,
+                comentarioAlumno:
+                    inscripcion.comentarioAlumno ?? datos.comentarioAlumno,
             });
 
             if (datos.modalidad) {
                 toast.success(`Modalidad actualizada a ${datos.modalidad}`);
             } else {
-                toast.success('Comentario guardado');
+                toast.success('Comentario de alumno guardado');
             }
         } catch (error: any) {
             console.error('Error al actualizar inscripción:', error);
@@ -454,36 +443,41 @@ export function Dashboard() {
 
     const handleGuardarComentarioGrupo = async (
         classData: CalendarClass,
-        comentario: string
+        notaHtml: string
     ) => {
         try {
             const grupoId = classData?.idGrupo;
-            if (!grupoId) {
-                toast.error('No se encontró el grupo para guardar la nota');
+            const fecha = classData?.date ? fechaClaseClave(classData.date) : '';
+            if (!grupoId || !fecha) {
+                toast.error('No se encontró la clase para guardar la nota');
                 return;
             }
 
-            const respuesta = await actualizarComentarioGrupo(grupoId, comentario);
-            const comentarioGuardado = respuesta?.grupo?.comentario ?? comentario;
+            const notaGuardada = sanitizarNotaHtml(
+                (await actualizarNotaClaseSesion(grupoId, fecha, notaHtml))?.nota
+                    ?.notaHtml ?? notaHtml
+            );
+
+            const mismaSesion = (cls: CalendarClass) =>
+                normalizar(cls.idGrupo || '') === normalizar(grupoId) &&
+                fechaClaseClave(cls.date) === fecha;
 
             setClasses((prev) =>
                 prev.map((cls) =>
-                    normalizar(cls.idGrupo || '') === normalizar(grupoId)
-                        ? { ...cls, comentarioGrupo: comentarioGuardado }
-                        : cls
+                    mismaSesion(cls) ? { ...cls, notaClase: notaGuardada } : cls
                 )
             );
 
             setSelectedClass((prev) =>
-                prev && normalizar(prev.idGrupo || '') === normalizar(grupoId)
-                    ? { ...prev, comentarioGrupo: comentarioGuardado }
+                prev && mismaSesion(prev)
+                    ? { ...prev, notaClase: notaGuardada }
                     : prev
             );
 
-            toast.success('Nota del grupo guardada');
+            toast.success('Nota de la clase guardada');
         } catch (error: any) {
-            console.error('Error al guardar nota del grupo:', error);
-            toast.error(error.message || 'Error al guardar nota del grupo');
+            console.error('Error al guardar nota de la clase:', error);
+            toast.error(error.message || 'Error al guardar la nota');
         }
     };
 
@@ -582,6 +576,8 @@ export function Dashboard() {
                                 date: fechaEvento,
                                 startTime: horaInicio,
                                 endTime: horaFin,
+                                diaClase: item.diaClase || '',
+                                duracion: item.duracion || '2 horas',
                                 teacher: { name: item.nombreProfesor || '', email: '' },
                                 students: studentsFiltrados,
                                 color: obtenerColorPorCurso(item.nombreCurso),
@@ -645,7 +641,7 @@ export function Dashboard() {
                     idAlumno: alumno.idAlumno,
                     nombreAlumno: alumno.nombreAlumno,
                     modalidad: alumno.modalidad || 'Presencial',
-                    comentarios: alumno.comentarios || '',
+                    comentarioAlumno: alumno.comentarioAlumno || '',
                     grupoIdInscripcion:
                       alumno.grupoIdInscripcion ||
                       r.idGrupoOrigen ||
@@ -698,7 +694,7 @@ export function Dashboard() {
               idAlumno: alumno.idAlumno,
               nombreAlumno: alumno.nombreAlumno,
               modalidad: alumno.modalidad || 'Presencial',
-              comentarios: alumno.comentarios || '',
+              comentarioAlumno: alumno.comentarioAlumno || '',
               grupoIdInscripcion:
                 alumno.grupoIdInscripcion ||
                 r.idGrupoOrigen ||
@@ -1123,7 +1119,9 @@ export function Dashboard() {
                             </p>
 
                             <p className="mt-1 text-sm font-black text-[#003B73]">
-                                Sistema de Gestión Académica
+                                {esVistaProfesor
+                                    ? `Mis clases${nombreProfesorSesion ? ` · ${nombreProfesorSesion}` : ''}`
+                                    : 'Sistema de Gestión Académica'}
                             </p>
                         </div>
                     </div>

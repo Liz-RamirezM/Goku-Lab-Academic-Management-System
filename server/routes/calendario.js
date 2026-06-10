@@ -5,7 +5,9 @@ import Reagendacion from "../models/Reagendacion.js";
 import ClaseCancelada from "../models/ClaseCancelada.js";
 import Profesor from "../models/Profesor.js";
 import Curso from "../models/Curso.js";
+import { sincronizarInscripcionesConCursosCatalogo } from "../utils/inscripcionesCurso.js";
 import { extraerFecha } from "../utils/parseFechas.js";
+import { calcularHoraFinDesdeDuracion } from "../utils/duracionClase.js";
 
 const router = express.Router();
 
@@ -89,43 +91,9 @@ const obtenerDiaDesdeFecha = (valor) => {
   return dias[fecha.getDay()];
 };
 
-// ✅ CAMBIO 9: Calcular hora de fin basada en duración
-const calcularHoraFin = (horaInicio, duracion) => {
-  if (!horaInicio || !duracion) return "";
-  
-  // Parse horaInicio (HH:mm)
-  const [horas, minutos] = String(horaInicio).split(":").map(Number);
-  if (isNaN(horas) || isNaN(minutos)) return "";
-  
-  // Parse duración (ej: "2 horas", "1.5 horas", "90 minutos")
-  const duracionStr = String(duracion).toLowerCase().trim();
-  let totalMinutos = 0;
-  
-  const matchHoras = duracionStr.match(/(\d+(?:\.\d+)?)\s*horas?/);
-  if (matchHoras) {
-    totalMinutos += Number(matchHoras[1]) * 60;
-  }
-  
-  const matchMinutos = duracionStr.match(/(\d+)\s*min/);
-  if (matchMinutos) {
-    totalMinutos += Number(matchMinutos[1]);
-  }
-  
-  if (totalMinutos === 0) totalMinutos = 120; // Default 2 horas
-  
-  let horaFin = horas;
-  let minutoFin = minutos + totalMinutos;
-  
-  while (minutoFin >= 60) {
-    horaFin += 1;
-    minutoFin -= 60;
-  }
-  
-  return `${String(horaFin).padStart(2, "0")}:${String(minutoFin).padStart(2, "0")}`;
-};
-
 router.get("/", async (req, res) => {
   try {
+    await sincronizarInscripcionesConCursosCatalogo();
     const gruposRaw = await Grupo.find().lean();
     const inscripcionesRaw = await Inscripcion.find().lean();
     const reagendacionesRaw = (await Reagendacion.find().lean()).filter(
@@ -279,7 +247,7 @@ router.get("/", async (req, res) => {
           idAlumno: a.idAlumno || a.id_alumno || "",
           nombreAlumno: a.nombreAlumno || a.nombre || a.Alumno || "",
           modalidad: a.modalidad || "Presencial",
-          comentarios: a.comentarios || "",
+          comentarioAlumno: a.comentarioAlumno || "",
           grupoIdInscripcion:
             grupo.IdGrupo || grupo.idGrupo || grupo.GrupoId || "",
           inscripcionCreadaEn: a.fechaInscripcion || a.createdAt || a.updatedAt || null,
@@ -317,7 +285,7 @@ router.get("/", async (req, res) => {
             idAlumno: r.idAlumno || "",
             nombreAlumno: r.nombreAlumno || "",
             modalidad: insOrigenAlumno?.modalidad || r.modalidad || "Presencial",
-            comentarios: insOrigenAlumno?.comentarios || "",
+            comentarioAlumno: insOrigenAlumno?.comentarioAlumno || "",
             grupoIdInscripcion: grupoOrigenIns,
             reagendacion: {
               tipo: "origen",
@@ -360,7 +328,7 @@ router.get("/", async (req, res) => {
       // ✅ CAMBIO 9: Calcular hora fin basada en duración
       const horaInicio = grupo.horaClase || grupo["horaClase "] || "";
       const duracion = grupo.duracionClase || "2 horas";
-      const horaFin = calcularHoraFin(horaInicio, duracion);
+      const horaFin = calcularHoraFinDesdeDuracion(horaInicio, duracion);
 
       return {
         tipo: "base",
@@ -504,7 +472,7 @@ router.get("/", async (req, res) => {
         idAlumno: r.idAlumno || "",
         nombreAlumno: r.nombreAlumno || "",
         modalidad: insOrigen?.modalidad || r.modalidad || "Presencial",
-        comentarios: insOrigen?.comentarios || "",
+        comentarioAlumno: insOrigen?.comentarioAlumno || "",
         grupoIdInscripcion: grupoOrigenIns,
         reagendacion: {
           tipo: "destino",
@@ -531,15 +499,48 @@ router.get("/", async (req, res) => {
       })
     );
 
+    let clasesBaseResp = clasesBase;
+    let reagendacionesResp = clasesReagendadas;
+    let clasesCanceladasResp = clasesCanceladasRaw.map((cancelacion) => ({
+      grupoId: cancelacion.idGrupo,
+      fecha: extraerFecha(cancelacion.fecha),
+      claseCanceladaId: cancelacion.claseCanceladaId,
+      motivo: cancelacion.motivo || "",
+    }));
+
+    const rolUsuario = String(req.user?.rol || "").toLowerCase();
+    if (rolUsuario === "profesor") {
+      const idProfesorSesion = normalizar(req.user?.idProfesor || "");
+      if (!idProfesorSesion) {
+        return res.status(403).json({
+          error: "Tu cuenta no está vinculada a un maestro del catálogo",
+        });
+      }
+
+      clasesBaseResp = clasesBase.filter(
+        (clase) => normalizar(clase.idProfesor) === idProfesorSesion
+      );
+
+      reagendacionesResp = clasesReagendadas.filter(
+        (clase) => normalizar(clase.idProfesor) === idProfesorSesion
+      );
+
+      const gruposVisibles = new Set(
+        [
+          ...clasesBaseResp.map((c) => normalizar(c.idGrupo)),
+          ...reagendacionesResp.map((c) => normalizar(c.idGrupo)),
+        ].filter(Boolean)
+      );
+
+      clasesCanceladasResp = clasesCanceladasResp.filter((cancelacion) =>
+        gruposVisibles.has(normalizar(cancelacion.grupoId))
+      );
+    }
+
     res.json({
-      clasesBase,
-      reagendaciones: clasesReagendadas,
-      clasesCanceladas: clasesCanceladasRaw.map((cancelacion) => ({
-        grupoId: cancelacion.idGrupo,
-        fecha: extraerFecha(cancelacion.fecha),
-        claseCanceladaId: cancelacion.claseCanceladaId,
-        motivo: cancelacion.motivo || "",
-      })),
+      clasesBase: clasesBaseResp,
+      reagendaciones: reagendacionesResp,
+      clasesCanceladas: clasesCanceladasResp,
     });
   } catch (error) {
     console.error("Error al construir calendario:", error);

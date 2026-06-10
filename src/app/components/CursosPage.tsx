@@ -75,8 +75,8 @@ export function CursosPage() {
             await actualizarEstatusCurso(curso.idCurso, nuevoEstatus);
             toast.success(
                 nuevoEstatus === 'Activo'
-                    ? 'Curso activado (ya aparece en el catálogo)'
-                    : 'Curso inactivado (oculto del catálogo)'
+                    ? 'Curso activado. Los alumnos pausados por este curso se reactivaron.'
+                    : 'Curso inactivado. Los alumnos de sus grupos pasaron a inactivos.'
             );
             cargarDatos();
         } catch (err: any) {
@@ -90,7 +90,8 @@ export function CursosPage() {
         if (
             !window.confirm(
                 `¿Borrar del sistema el curso "${curso.nombreCurso}"?\n\n` +
-                    'Se eliminará por completo. Si tiene grupos asignados, esas clases quedarán SIN curso asignado.'
+                    "No se puede borrar si tiene alumnos activos en sus grupos. " +
+                    "Inactiva a los alumnos en ese curso (siguen en el sistema) y elimina los grupos antes."
             )
         ) {
             return;

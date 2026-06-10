@@ -5,6 +5,7 @@ import {
   eliminarHistorialCursoBaja,
   reactivarInscripcion,
   actualizarAlumno,
+  actualizarInscripcionAlumno,
   getAlumnos,
   getGrupos,
   getInscripciones,
@@ -33,8 +34,30 @@ function normalizar(valor: any) {
   return String(valor || "").trim().toUpperCase();
 }
 
-function esGrupoInactivo(estatus?: string) {
-  return String(estatus || "Activa").trim().toLowerCase() === "baja";
+function esGrupoInactivo(
+  estatus?: string,
+  pago?: { activo?: boolean; status?: string }
+) {
+  const e = String(estatus || "Activa").trim().toLowerCase();
+  if (e === "baja" || e === "inactivo" || e === "inactiva") return true;
+  if (pago?.activo === false) return true;
+  if (String(pago?.status || "").trim().toLowerCase() === "baja") return true;
+  return false;
+}
+
+function estatusInscripcion(ins: { estatus?: string; Estatus?: string }) {
+  return String(ins.estatus || ins.Estatus || "Activa").trim();
+}
+
+function grupoIdDeInscripcion(ins: {
+  grupoId?: string;
+  GrupoId?: string;
+  idGrupo?: string;
+  IdGrupo?: string;
+}) {
+  return String(
+    ins.grupoId || ins.GrupoId || ins.idGrupo || ins.IdGrupo || ""
+  ).trim();
 }
 
 type FiltroVistaAlumnos = "activos" | "inactivos" | "todos";
@@ -207,6 +230,10 @@ function HistorialMensual({
   );
 }
 
+function claveInscripcion(idAlumno: string, grupoId: string) {
+  return `${normalizar(idAlumno)}|${normalizar(grupoId)}`;
+}
+
 export function AlumnosPage() {
   const [cargando, setCargando] = useState(true);
   const [error, setError] = useState<string>("");
@@ -222,8 +249,20 @@ export function AlumnosPage() {
   const [guardandoNota, setGuardandoNota] = useState<Record<string, boolean>>({});
   const [alumnoDraft, setAlumnoDraft] = useState<Record<string, any>>({});
   const [guardandoAlumno, setGuardandoAlumno] = useState<Record<string, boolean>>({});
+  const [comentariosInscripcionDraft, setComentariosInscripcionDraft] = useState<
+    Record<string, string>
+  >({});
+  const [guardandoComentarioInscripcion, setGuardandoComentarioInscripcion] =
+    useState<Record<string, boolean>>({});
+  const [montoMensualidadDraft, setMontoMensualidadDraft] = useState<
+    Record<string, string>
+  >({});
+  const [guardandoMontoMensualidad, setGuardandoMontoMensualidad] = useState<
+    Record<string, boolean>
+  >({});
   const [showInscripcion, setShowInscripcion] = useState(false);
   const [filtroVista, setFiltroVista] = useState<FiltroVistaAlumnos>("activos");
+  const [filtroCurso, setFiltroCurso] = useState("");
   const [alumnoParaInscripcion, setAlumnoParaInscripcion] = useState<{
     idAlumno: string;
     nombreAlumno?: string;
@@ -286,19 +325,97 @@ export function AlumnosPage() {
 
   const pagosMap = useMemo(() => buildPagosMap(pagos), [pagos]);
 
+  const cursosDisponibles = useMemo(() => {
+    const nombres = new Set<string>();
+    for (const ins of inscripciones) {
+      const grupoId = grupoIdDeInscripcion(ins);
+      if (!grupoId) continue;
+      const grupo = gruposMap.get(normalizar(grupoId));
+      if (!grupo) continue;
+      const nombre = (grupo?.nombreCurso || "").trim();
+      if (nombre) nombres.add(nombre);
+    }
+    return Array.from(nombres).sort((a, b) => a.localeCompare(b, "es"));
+  }, [inscripciones, gruposMap]);
+
+  const resumen = useMemo(() => {
+    const alumnosSet = new Set<string>();
+    let totalCursos = 0;
+
+    for (const ins of inscripciones) {
+      const idAlumno = String(ins.idAlumno || (ins as any).IdAlumno || "").trim();
+      const grupoId = grupoIdDeInscripcion(ins);
+      if (!idAlumno || !grupoId) continue;
+
+      const grupo = gruposMap.get(normalizar(grupoId));
+      if (!grupo) continue;
+
+      const nombreCurso = (grupo.nombreCurso || "Curso").toString();
+      const pago = resolverPagoParaInscripcion(
+        pagosMap,
+        {
+          idAlumno,
+          grupoId,
+          montoMensualidad: ins.montoMensualidad,
+          diaPago: ins.diaPago,
+          fechaInicioPago: ins.fechaInicioPago,
+          estatus: estatusInscripcion(ins),
+        },
+        nombreCurso
+      );
+      const inactivo = esGrupoInactivo(estatusInscripcion(ins), pago);
+      if (filtroVista === "activos" && inactivo) continue;
+      if (filtroVista === "inactivos" && !inactivo) continue;
+      if (
+        filtroCurso &&
+        normalizar(nombreCurso) !== normalizar(filtroCurso)
+      ) {
+        continue;
+      }
+
+      const alumnoDb = alumnosMap.get(normalizar(idAlumno));
+      const nombre = (
+        alumnoDb?.nombreAlumno ||
+        alumnoDb?.nombre ||
+        ins.nombreAlumno ||
+        idAlumno
+      ).toString();
+
+      if (busqueda.trim()) {
+        const q = busqueda.trim().toLowerCase();
+        if (
+          !nombre.toLowerCase().includes(q) &&
+          !idAlumno.toLowerCase().includes(q)
+        ) {
+          continue;
+        }
+      }
+
+      alumnosSet.add(normalizar(idAlumno));
+      totalCursos += 1;
+    }
+
+    return {
+      totalAlumnos: alumnosSet.size,
+      totalCursos,
+    };
+  }, [inscripciones, alumnosMap, gruposMap, pagosMap, filtroVista, filtroCurso, busqueda]);
+
   const alumnosInscritos = useMemo(() => {
     const porAlumno = new Map<string, { alumnoId: string; nombre: string; cursos: any[] }>();
 
     for (const ins of inscripciones) {
       const idAlumno = String(ins.idAlumno || "").trim();
-      const grupoId = String(ins.grupoId || "").trim();
+      const grupoId = grupoIdDeInscripcion(ins);
       if (!idAlumno || !grupoId) continue;
+
+      const grupo = gruposMap.get(normalizar(grupoId));
+      if (!grupo) continue;
 
       const alumnoDb = alumnosMap.get(normalizar(idAlumno));
       const nombre = (alumnoDb?.nombreAlumno || alumnoDb?.nombre || ins.nombreAlumno || idAlumno).toString();
 
-      const grupo = gruposMap.get(normalizar(grupoId));
-      const nombreCurso = (grupo?.nombreCurso || "Curso").toString();
+      const nombreCurso = (grupo.nombreCurso || "Curso").toString();
 
       const pago = resolverPagoParaInscripcion(
         pagosMap,
@@ -308,7 +425,7 @@ export function AlumnosPage() {
           montoMensualidad: ins.montoMensualidad,
           diaPago: ins.diaPago,
           fechaInicioPago: ins.fechaInicioPago,
-          estatus: ins.estatus,
+          estatus: estatusInscripcion(ins),
         },
         nombreCurso
       );
@@ -332,8 +449,11 @@ export function AlumnosPage() {
         fechaInicioPago: ins.fechaInicioPago ?? pago?.fechaPago,
         fechaInscripcion: ins.fechaInscripcion,
         createdAt: ins.createdAt,
-        estatus: ins.estatus || "Activa",
+        estatus: esGrupoInactivo(estatusInscripcion(ins), pago)
+          ? "Baja"
+          : estatusInscripcion(ins),
         fechaBaja: ins.fechaBaja,
+        motivoBaja: ins.motivoBaja || "",
         montoMensualidad:
           montoDesdeIns > 0 ? montoDesdeIns : montoDesdePago,
         comentarios: ins.comentarios || "",
@@ -363,17 +483,36 @@ export function AlumnosPage() {
     lista.sort((a, b) => String(a.nombre).localeCompare(String(b.nombre), "es"));
 
     if (filtroVista === "activos") {
-      lista = lista.filter((item) =>
-        item.cursos.some((c: any) => !esGrupoInactivo(c.estatus))
-      );
+      lista = lista
+        .map((item) => ({
+          ...item,
+          cursos: item.cursos.filter(
+            (c: any) => !esGrupoInactivo(c.estatus, c.pago)
+          ),
+        }))
+        .filter((item) => item.cursos.length > 0);
     } else if (filtroVista === "inactivos") {
-      lista = lista.filter((item) =>
-        item.cursos.some((c: any) => esGrupoInactivo(c.estatus))
-      );
+      lista = lista
+        .map((item) => ({
+          ...item,
+          cursos: item.cursos.filter((c: any) => esGrupoInactivo(c.estatus, c.pago)),
+        }))
+        .filter((item) => item.cursos.length > 0);
+    }
+
+    if (filtroCurso) {
+      lista = lista
+        .map((item) => ({
+          ...item,
+          cursos: item.cursos.filter(
+            (c: any) => normalizar(c.nombreCurso) === normalizar(filtroCurso)
+          ),
+        }))
+        .filter((item) => item.cursos.length > 0);
     }
 
     return lista;
-  }, [inscripciones, alumnosMap, gruposMap, pagosMap, busqueda, filtroVista]);
+  }, [inscripciones, alumnosMap, gruposMap, pagosMap, busqueda, filtroVista, filtroCurso]);
 
   const handleInactivarEnGrupo = async (
     idAlumno: string,
@@ -436,6 +575,7 @@ export function AlumnosPage() {
     try {
       setGuardandoAlumno((prev) => ({ ...prev, [key]: true }));
       await actualizarAlumno(idAlumno, {
+        nombreAlumno: draft.nombreAlumno,
         telefono: draft.telefono,
         tutor: draft.tutor,
       });
@@ -445,6 +585,51 @@ export function AlumnosPage() {
       toast.error(e.message || "Error al actualizar alumno");
     } finally {
       setGuardandoAlumno((prev) => ({ ...prev, [key]: false }));
+    }
+  };
+
+  const handleGuardarComentarioInscripcion = async (
+    idAlumno: string,
+    grupoId: string
+  ) => {
+    const key = claveInscripcion(idAlumno, grupoId);
+    const comentarios = comentariosInscripcionDraft[key] ?? "";
+
+    try {
+      setGuardandoComentarioInscripcion((prev) => ({ ...prev, [key]: true }));
+      await actualizarInscripcionAlumno(idAlumno, grupoId, { comentarios });
+      toast.success("Comentario de inscripción guardado");
+      await recargar();
+    } catch (e: any) {
+      toast.error(e.message || "Error al guardar comentario de inscripción");
+    } finally {
+      setGuardandoComentarioInscripcion((prev) => ({ ...prev, [key]: false }));
+    }
+  };
+
+  const handleGuardarMontoMensualidad = async (
+    idAlumno: string,
+    grupoId: string
+  ) => {
+    const key = claveInscripcion(idAlumno, grupoId);
+    const monto = Number(montoMensualidadDraft[key]);
+
+    if (!Number.isFinite(monto) || monto <= 0) {
+      toast.error("Captura un monto válido mayor a 0");
+      return;
+    }
+
+    try {
+      setGuardandoMontoMensualidad((prev) => ({ ...prev, [key]: true }));
+      await actualizarInscripcionAlumno(idAlumno, grupoId, {
+        montoMensualidad: monto,
+      });
+      toast.success("Mensualidad actualizada");
+      await recargar();
+    } catch (e: any) {
+      toast.error(e.message || "Error al actualizar la mensualidad");
+    } finally {
+      setGuardandoMontoMensualidad((prev) => ({ ...prev, [key]: false }));
     }
   };
 
@@ -533,6 +718,18 @@ export function AlumnosPage() {
                 </button>
               ))}
             </div>
+            <select
+              value={filtroCurso}
+              onChange={(e) => setFiltroCurso(e.target.value)}
+              className="w-[220px] rounded-xl border border-cyan-100 bg-white px-4 py-3 text-sm font-medium outline-none focus:ring-2 focus:ring-cyan-300"
+            >
+              <option value="">Todos los cursos</option>
+              {cursosDisponibles.map((nombre) => (
+                <option key={nombre} value={nombre}>
+                  {nombre}
+                </option>
+              ))}
+            </select>
             <input
               value={busqueda}
               onChange={(e) => setBusqueda(e.target.value)}
@@ -544,21 +741,53 @@ export function AlumnosPage() {
       </header>
 
       <main className="mx-auto w-full max-w-none px-6 py-8 lg:px-10">
+        <div className="mb-6 grid grid-cols-1 gap-4 sm:grid-cols-2">
+          <div className="rounded-2xl border border-cyan-100 bg-white px-6 py-5 shadow-sm">
+            <div className="text-[11px] font-black uppercase tracking-wider text-gray-400">
+              Alumnos inscritos
+            </div>
+            <div className="mt-2 text-4xl font-black text-[#0078D7]">
+              {resumen.totalAlumnos}
+            </div>
+            <p className="mt-1 text-sm font-medium text-gray-500">
+              Según filtros actuales
+            </p>
+          </div>
+          <div className="rounded-2xl border border-cyan-100 bg-white px-6 py-5 shadow-sm">
+            <div className="text-[11px] font-black uppercase tracking-wider text-gray-400">
+              Cursos dados
+            </div>
+            <div className="mt-2 text-4xl font-black text-[#003B73]">
+              {resumen.totalCursos}
+            </div>
+            <p className="mt-1 text-sm font-medium text-gray-500">
+              Inscripciones a grupos
+            </p>
+          </div>
+        </div>
+
         <div className="mb-6 rounded-2xl border border-cyan-100 bg-white px-5 py-4 text-sm text-gray-700 shadow-sm">
           <p className="font-black text-gray-900 mb-2">Flujo por grupo inscrito</p>
+          <p className="mb-2 text-xs text-gray-600">
+            Un alumno puede estar en varios cursos a la vez. Inactivar o dar de baja
+            afecta <strong>solo ese curso</strong>; el alumno sigue en el sistema y en
+            sus demás clases.
+          </p>
           <ol className="list-decimal list-inside space-y-1 font-medium">
             <li>
               <span className="font-black text-emerald-700">Activo</span> — inscrito
               al grupo (aparece en calendario y pagos).
             </li>
             <li>
-              <span className="font-black text-amber-800">Inactivo</span> — baja del
-              grupo con «Inactivar en este grupo» (deja de aparecer en calendario).
+              <span className="font-black text-amber-800">Inactivo</span> — con
+              «Inactivar en este grupo» deja ese curso (calendario y cobros de ese
+              grupo). Puede eliminarse el grupo del calendario cuando todos estén
+              inactivos.
             </li>
             <li>
-              <span className="font-black text-red-700">Baja del sistema</span> — elimina
-              por completo ese grupo con «Dar de baja del sistema» (solo cuando ya está
-              inactivo).
+              <span className="font-black text-red-700">Baja del sistema</span>{" "}
+              (opcional) — borra el historial de <strong>ese curso</strong> en Alumnos
+              inscritos. No elimina al alumno del catálogo ni de sus otros cursos.
             </li>
           </ol>
         </div>
@@ -582,14 +811,20 @@ export function AlumnosPage() {
               const isOpen = Boolean(expandido[normalizar(idAlumno)]);
               const keyAlumno = normalizar(idAlumno);
               const draftDatos = alumnoDraft[keyAlumno] || {};
+              const nombreValue =
+                draftDatos.nombreAlumno ??
+                alumnoDb?.nombreAlumno ??
+                alumnoDb?.nombre ??
+                a.nombre ??
+                "";
               const telefonoValue =
                 draftDatos.telefono ?? alumnoDb?.telefono ?? "";
               const tutorValue = draftDatos.tutor ?? alumnoDb?.tutor ?? "";
               const gruposActivos = a.cursos.filter(
-                (c: any) => !esGrupoInactivo(c.estatus)
+                (c: any) => !esGrupoInactivo(c.estatus, c.pago)
               );
               const gruposInactivos = a.cursos.filter((c: any) =>
-                esGrupoInactivo(c.estatus)
+                esGrupoInactivo(c.estatus, c.pago)
               );
               const soloGruposInactivos =
                 gruposActivos.length === 0 && gruposInactivos.length > 0;
@@ -685,10 +920,29 @@ export function AlumnosPage() {
                         </div>
                       )}
 
-                      <div className="mt-4 grid grid-cols-1 gap-3 md:grid-cols-3">
+                      <div className="mt-4 grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-4">
                         <div className="rounded-xl border border-gray-200 bg-white px-4 py-3">
                           <div className="text-[10px] font-black text-gray-400 uppercase tracking-wider">
-                            Teléfono
+                            Nombre del alumno
+                          </div>
+                          <input
+                            value={nombreValue}
+                            onChange={(e) =>
+                              setAlumnoDraft((prev) => ({
+                                ...prev,
+                                [keyAlumno]: {
+                                  ...(prev[keyAlumno] || {}),
+                                  nombreAlumno: e.target.value,
+                                },
+                              }))
+                            }
+                            className="mt-1 w-full rounded-lg border border-gray-200 px-3 py-2 text-sm font-medium outline-none focus:ring-2 focus:ring-cyan-300"
+                          />
+                        </div>
+
+                        <div className="rounded-xl border border-gray-200 bg-white px-4 py-3">
+                          <div className="text-[10px] font-black text-gray-400 uppercase tracking-wider">
+                            Teléfono del tutor (WhatsApp)
                           </div>
                           <input
                             value={telefonoValue}
@@ -707,7 +961,7 @@ export function AlumnosPage() {
 
                         <div className="rounded-xl border border-gray-200 bg-white px-4 py-3">
                           <div className="text-[10px] font-black text-gray-400 uppercase tracking-wider">
-                            Tutor
+                            Nombre del tutor
                           </div>
                           <input
                             value={tutorValue}
@@ -803,7 +1057,7 @@ export function AlumnosPage() {
                           const fechaAltaSistema = c.createdAt || null;
                           const fechaInicioClases = c.fechaInscripcion || null;
                           const fechaBaja = c.fechaBaja || null;
-                          const esInactivo = esGrupoInactivo(c.estatus);
+                          const esInactivo = esGrupoInactivo(c.estatus, c.pago);
 
                           return (
                             <div
@@ -853,6 +1107,9 @@ export function AlumnosPage() {
                                   {esInactivo ? (
                                     <div className="text-xs font-black uppercase text-amber-900 bg-amber-100 border border-amber-200 rounded-full px-3 py-1">
                                       Inactivo
+                                      {c.motivoBaja === "Curso inactivo"
+                                        ? " · curso pausado"
+                                        : ""}
                                       {fechaBaja
                                         ? ` · ${new Date(fechaBaja).toLocaleDateString("es-MX")}`
                                         : ""}
@@ -862,8 +1119,54 @@ export function AlumnosPage() {
                                       Activo
                                     </div>
                                   )}
-                                  <div className="text-xs font-black text-gray-700 bg-white border border-gray-200 rounded-full px-3 py-1">
-                                    Mensualidad: {formatearMoneda(c.montoMensualidad)}
+                                  <div className="flex flex-wrap items-center gap-2 rounded-xl border border-gray-200 bg-white px-3 py-2">
+                                    <span className="text-[10px] font-black uppercase text-gray-500">
+                                      Mensualidad
+                                    </span>
+                                    <div className="relative">
+                                      <span className="absolute left-2 top-1/2 -translate-y-1/2 text-xs font-bold text-gray-400">
+                                        $
+                                      </span>
+                                      <input
+                                        type="number"
+                                        min="1"
+                                        step="0.01"
+                                        value={
+                                          montoMensualidadDraft[
+                                            claveInscripcion(c.idAlumno, c.grupoId)
+                                          ] ?? String(c.montoMensualidad ?? "")
+                                        }
+                                        onChange={(e) =>
+                                          setMontoMensualidadDraft((prev) => ({
+                                            ...prev,
+                                            [claveInscripcion(c.idAlumno, c.grupoId)]:
+                                              e.target.value,
+                                          }))
+                                        }
+                                        className="w-28 rounded-lg border border-gray-200 bg-gray-50 pl-6 pr-2 py-1.5 text-xs font-bold text-gray-900 focus:outline-none focus:border-cyan-400"
+                                      />
+                                    </div>
+                                    <button
+                                      type="button"
+                                      disabled={
+                                        guardandoMontoMensualidad[
+                                          claveInscripcion(c.idAlumno, c.grupoId)
+                                        ]
+                                      }
+                                      onClick={() =>
+                                        handleGuardarMontoMensualidad(
+                                          c.idAlumno,
+                                          c.grupoId
+                                        )
+                                      }
+                                      className="rounded-lg bg-cyan-600 px-3 py-1.5 text-[10px] font-black uppercase text-white hover:bg-cyan-700 disabled:opacity-50"
+                                    >
+                                      {guardandoMontoMensualidad[
+                                        claveInscripcion(c.idAlumno, c.grupoId)
+                                      ]
+                                        ? "..."
+                                        : "Guardar"}
+                                    </button>
                                   </div>
                                   {pago?.status ? (
                                     <div
@@ -929,6 +1232,84 @@ export function AlumnosPage() {
                               </div>
 
                               <div className="p-4 space-y-4">
+                                <div className="rounded-xl border border-gray-200 overflow-hidden">
+                                  <div className="px-4 py-2 bg-gray-50 border-b border-gray-200">
+                                    <div className="text-[10px] font-black text-gray-500 uppercase tracking-wider">
+                                      Comentario de inscripción
+                                    </div>
+                                  </div>
+                                  <div className="p-4 space-y-3">
+                                    {(() => {
+                                      const keyIns = claveInscripcion(
+                                        c.idAlumno,
+                                        c.grupoId
+                                      );
+                                      const comentarioActual = c.comentarios || "";
+                                      const draft =
+                                        comentariosInscripcionDraft[keyIns] ??
+                                        comentarioActual;
+
+                                      return (
+                                        <>
+                                          <textarea
+                                            value={draft}
+                                            onChange={(e) =>
+                                              setComentariosInscripcionDraft(
+                                                (prev) => ({
+                                                  ...prev,
+                                                  [keyIns]: e.target.value,
+                                                })
+                                              )
+                                            }
+                                            rows={2}
+                                            placeholder="Notas al momento de inscribir al alumno en este curso..."
+                                            className="w-full resize-y rounded-xl border border-gray-200 bg-white p-3 text-sm text-gray-800 outline-none focus:ring-2 focus:ring-cyan-300"
+                                          />
+                                          <div className="flex justify-end">
+                                            <button
+                                              type="button"
+                                              onClick={() =>
+                                                handleGuardarComentarioInscripcion(
+                                                  c.idAlumno,
+                                                  c.grupoId
+                                                )
+                                              }
+                                              disabled={
+                                                Boolean(
+                                                  guardandoComentarioInscripcion[
+                                                    keyIns
+                                                  ]
+                                                ) ||
+                                                draft.trim() ===
+                                                  String(comentarioActual).trim()
+                                              }
+                                              className={`rounded-xl px-4 py-2 text-xs font-black transition-colors ${
+                                                Boolean(
+                                                  guardandoComentarioInscripcion[
+                                                    keyIns
+                                                  ]
+                                                ) ||
+                                                draft.trim() ===
+                                                  String(comentarioActual).trim()
+                                                  ? "bg-gray-100 text-gray-400 cursor-not-allowed"
+                                                  : "bg-cyan-500 text-white hover:bg-cyan-600"
+                                              }`}
+                                            >
+                                              {Boolean(
+                                                guardandoComentarioInscripcion[
+                                                  keyIns
+                                                ]
+                                              )
+                                                ? "Guardando..."
+                                                : "Guardar comentario"}
+                                            </button>
+                                          </div>
+                                        </>
+                                      );
+                                    })()}
+                                  </div>
+                                </div>
+
                                 {pago ? (
                                   <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
                                     <div className="rounded-xl border border-gray-200 bg-white px-4 py-3">

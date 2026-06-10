@@ -1,17 +1,20 @@
-import mongoose from 'mongoose';
+import mongoose from "mongoose";
 
-const abonoSchema = new mongoose.Schema({
-    abonoId: { type: String, required: true, unique: true },
+const abonoSchema = new mongoose.Schema(
+  {
+    abonoId: { type: String, required: true, index: true },
+    pagoId: { type: String, required: true, index: true },
     nombreAlumno: { type: String, required: true },
-    pagoId: { type: String, required: true },
-    fechaAbono: { type: String, required: true },
     montoAbono: { type: Number, required: true },
-    metodoAbono: { type: String, required: true },
-    numeroDeabono: { type: String, required: true },
-}, {
+    metodoAbono: { type: String, default: "Efectivo" },
+    fechaAbono: { type: Date, default: () => new Date() },
+    numeroDeabono: { type: String, default: "1" },
+  },
+  {
     collection: "abonos",
-    versionKey: false
-});
+    versionKey: false,
+    timestamps: true,
+  }
+);
 
-// Aquí es donde exportas el modelo para que 'pagos.js' pueda usar Abono.find()
-export default mongoose.model('Abono', abonoSchema);
+export default mongoose.model("Abono", abonoSchema);
